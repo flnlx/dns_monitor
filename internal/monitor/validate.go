@@ -159,6 +159,18 @@ func ValidateConfig(c *model.Config) error {
 	if math.IsNaN(c.ReferenceHistoryHours) || math.IsInf(c.ReferenceHistoryHours, 0) || c.ReferenceHistoryHours < 0 || c.ReferenceHistoryHours > 720 {
 		return errors.New("可信近期历史范围为 0–720 小时，0 表示关闭历史参考")
 	}
+	if c.RatingWindowMinutes < 5 || c.RatingWindowMinutes > 1440 {
+		return errors.New("评级统计窗口范围为 5–1440 分钟")
+	}
+	if c.RatingMinSamples < 1 || c.RatingMinSamples > 100 {
+		return errors.New("评级最低采样数范围为 1–100 次")
+	}
+	if c.RatingMinCoverageMinutes < 0 || c.RatingMinCoverageMinutes > 1440 {
+		return errors.New("评级最低覆盖时间范围为 0–1440 分钟，0 表示不要求覆盖时间")
+	}
+	if c.RatingMinCoverageMinutes > c.RatingWindowMinutes {
+		return errors.New("评级最低覆盖时间不能超过评级统计窗口")
+	}
 	if len(c.Domains) == 0 || len(c.Domains) > 100 {
 		return errors.New("请配置 1–100 个探测域名")
 	}

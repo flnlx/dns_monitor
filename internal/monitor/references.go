@@ -11,35 +11,36 @@ import (
 )
 
 const referenceMinInterval = 30 * time.Second
-const referenceRecheckInterval = 5 * time.Minute
 
-// One collection per domain is shared by every target. Expired TTLs never become
-// fresh because collection is rate-limited: the persistent pool decides whether
-// an address is fresh, historical or expired independently of this budget.
+// Cold-start collection is shared per domain and rate limited when no eligible
+// observations exist. A usable persistent pool always takes precedence over
+// collection state: ordinary trusted probes keep that pool up to date.
 type referenceCollection struct {
 	done        chan struct{}
 	fingerprint string
 	nextAt      int64
-	lastForced  int64
-	complete    bool
 	err         error
 }
 
-func (m *Monitor) references(ctx context.Context, domain model.Domain, cfg model.Config, force bool) ([]model.Reference, bool, error) {
+func (m *Monitor) references(ctx context.Context, domain model.Domain, cfg model.Config) ([]model.Reference, error) {
 	key := domain.Name + "\x00" + domain.Type
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, false, err
+			return nil, err
+		}
+		now := time.Now().UnixMilli()
+		refs, err := m.st.TrustedReferences(domain, now, cfg.ReferenceHistoryHours)
+		if err != nil || hasUsableReference(refs, now, cfg.ReferenceHistoryHours) {
+			return refs, err
 		}
 		trusted, fingerprint, err := m.trustedSourceSnapshot(cfg)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		now := time.Now().UnixMilli()
 		m.mu.Lock()
 		if m.config.Concurrency == 0 {
 			m.mu.Unlock()
-			return nil, false, errors.New("可信参考探测已暂停")
+			return nil, errors.New("可信参考探测已暂停")
 		}
 		state := m.referenceCollections[key]
 		if state == nil {
@@ -47,134 +48,95 @@ func (m *Monitor) references(ctx context.Context, domain model.Domain, cfg model
 			m.referenceCollections[key] = state
 		}
 		if state.done != nil {
-			done := state.done
+			done, changed := state.done, m.changed
 			m.mu.Unlock()
+			// Subscribe before re-reading the pool so a normal trusted probe
+			// cannot fill it between our read and notification registration.
+			now = time.Now().UnixMilli()
+			refs, err = m.st.TrustedReferences(domain, now, cfg.ReferenceHistoryHours)
+			if err != nil || hasUsableReference(refs, now, cfg.ReferenceHistoryHours) {
+				return refs, err
+			}
 			select {
 			case <-done:
 				continue
+			case <-changed:
+				continue
 			case <-ctx.Done():
-				return nil, false, ctx.Err()
+				return nil, ctx.Err()
 			}
 		}
-		canReuse := state.fingerprint == fingerprint && now < state.nextAt
-		if force {
-			canReuse = state.fingerprint == fingerprint && state.lastForced > 0 && now-state.lastForced < referenceRecheckInterval.Milliseconds()
-		}
-		if canReuse {
-			complete, previousErr := state.complete, state.err
+		if state.fingerprint == fingerprint && now < state.nextAt {
+			previousErr := state.err
 			m.mu.Unlock()
-			refs, err := m.st.TrustedReferences(domain, now, cfg.ReferenceHistoryHours)
-			if err != nil {
-				return nil, false, err
-			}
-			_, currentFingerprint, snapshotErr := m.trustedSourceSnapshot(cfg)
-			if snapshotErr != nil || currentFingerprint != fingerprint {
-				if snapshotErr == nil {
-					snapshotErr = errors.New("可信来源配置在参考读取期间发生变化，等待重新采集")
-				}
-				m.mu.Lock()
-				if state.done == nil && state.fingerprint == fingerprint {
-					state.nextAt = 0
-					state.lastForced = 0
-					state.complete = false
-					state.err = snapshotErr
-				}
-				m.mu.Unlock()
-				return refs, false, snapshotErr
-			}
-			return refs, complete && referenceSourcesPresent(refs, trusted), previousErr
+			return refs, previousErr
 		}
 		done := make(chan struct{})
 		state.done = done
 		state.fingerprint = fingerprint
-		if force {
-			state.lastForced = now
-		}
 		generation := m.cacheGeneration
 		m.mu.Unlock()
 
-		complete := true
 		var collectionErr error
-		next := now + int64(cfg.ReferenceTTLSeconds)*1000
-		if cfg.ReferenceTTLSeconds == 0 {
-			next = now
-		}
 		for _, source := range trusted {
-			current, err := m.st.GetServer(source.ID)
-			if err != nil || !current.Enabled || !current.Trusted || current.Address != source.Address || current.TrustEpoch != source.TrustEpoch {
-				complete = false
-				continue
-			}
-			result, err := m.lookupMode(ctx, source, domain, cfg, true, force)
-			if err != nil {
-				complete = false
+			// A normal scheduled probe may have filled the pool while this
+			// caller was waiting. Never send another query when it is usable.
+			now = time.Now().UnixMilli()
+			refs, err = m.st.TrustedReferences(domain, now, cfg.ReferenceHistoryHours)
+			if err != nil || hasUsableReference(refs, now, cfg.ReferenceHistoryHours) {
 				collectionErr = err
 				break
 			}
-			if !result.Success || result.Rcode != "NOERROR" || len(result.Answers) == 0 {
-				complete = false
+			current, err := m.st.GetServer(source.ID)
+			if err != nil || !current.Enabled || !current.Trusted || current.Address != source.Address || current.TrustEpoch != source.TrustEpoch {
+				continue
 			}
-			cacheDeadline := result.Timestamp + int64(cfg.ReferenceTTLSeconds)*1000
-			if cacheDeadline < next {
-				next = cacheDeadline
+			_, lookupErr := m.lookup(ctx, source, domain, cfg, true)
+			// Read back the current, enabled source pool; a source changed in
+			// flight cannot contribute its revoked observation.
+			now = time.Now().UnixMilli()
+			refs, err = m.st.TrustedReferences(domain, now, cfg.ReferenceHistoryHours)
+			if err != nil {
+				collectionErr = err
+				break
 			}
-			// Actual record TTL controls normal reuse; the independent minimum budget
-			// prevents many targets from chasing very short or missing TTLs.
-			if len(result.Records) == 0 {
-				next = now
+			if hasUsableReference(refs, now, cfg.ReferenceHistoryHours) {
+				collectionErr = nil
+				break
 			}
-			for _, record := range result.Records {
-				if record.ExpiresAt < next {
-					next = record.ExpiresAt
-				}
+			if lookupErr != nil {
+				collectionErr = lookupErr
 			}
-		}
-		if err := ctx.Err(); err != nil {
-			complete = false
-			collectionErr = err
+			if ctx.Err() != nil {
+				break
+			}
+			m.mu.Lock()
+			interrupted := m.config.Concurrency == 0 || generation != m.cacheGeneration
+			m.mu.Unlock()
+			if interrupted {
+				break
+			}
 		}
 		finished := time.Now().UnixMilli()
-		refs, readErr := m.st.TrustedReferences(domain, finished, cfg.ReferenceHistoryHours)
-		if readErr != nil {
-			complete = false
-			collectionErr = readErr
-		}
-		_, currentFingerprint, snapshotErr := m.trustedSourceSnapshot(cfg)
-		if snapshotErr != nil || currentFingerprint != fingerprint {
-			complete = false
-			if snapshotErr != nil {
-				collectionErr = snapshotErr
-			} else {
-				collectionErr = errors.New("可信来源配置在采集期间发生变化，等待重新采集")
-			}
-		}
 		m.mu.Lock()
-		if m.config.Concurrency == 0 && collectionErr == nil {
-			complete = false
+		if err := ctx.Err(); err != nil {
+			collectionErr = err
+		} else if m.config.Concurrency == 0 {
 			collectionErr = errors.New("可信参考探测已暂停")
+		} else if generation != m.cacheGeneration {
+			collectionErr = errors.New("手动刷新使在途可信采集失效，等待新一轮参考")
 		}
-		if generation != m.cacheGeneration {
-			complete = false
-			if collectionErr == nil {
-				collectionErr = errors.New("手动刷新使在途可信采集失效，等待新一轮参考")
-			}
-		}
-		state.complete = complete
 		state.err = collectionErr
-		state.nextAt = next
-		if state.nextAt < finished+referenceMinInterval.Milliseconds() {
-			state.nextAt = finished + referenceMinInterval.Milliseconds()
-		}
-		// Interrupted collections must be retried after resume, and a manual refresh
-		// invalidates collection reuse without deleting trusted observation history.
-		if collectionErr != nil || generation != m.cacheGeneration {
+		state.nextAt = finished + referenceMinInterval.Milliseconds()
+		// Resume/manual refresh may retry immediately. Failed or empty DNS
+		// replies otherwise share the same budget, even across many targets.
+		if ctx.Err() != nil || m.config.Concurrency == 0 || generation != m.cacheGeneration {
 			state.nextAt = 0
-			state.lastForced = 0
 		}
 		state.done = nil
 		close(done)
 		m.mu.Unlock()
-		return refs, complete && referenceSourcesPresent(refs, trusted), collectionErr
+		return refs, collectionErr
 	}
 }
 
@@ -184,34 +146,27 @@ func (m *Monitor) classify(ctx context.Context, result *model.ProbeResult, domai
 		compareAt(result, nil, time.Now().UnixMilli(), cfg.ReferenceHistoryHours)
 		return nil
 	}
-	refs, complete, err := m.references(ctx, domain, cfg, false)
+	refs, err := m.references(ctx, domain, cfg)
 	compareAt(result, refs, time.Now().UnixMilli(), cfg.ReferenceHistoryHours)
-	if err == nil && (result.Pollution == "suspicious" || result.Pollution == "polluted") {
-		refs, complete, err = m.references(ctx, domain, cfg, true)
-	}
-	compareCollectionAt(result, refs, complete, time.Now().UnixMilli(), cfg.ReferenceHistoryHours)
 	if err != nil {
 		result.Pollution = "unknown"
-		result.Reason = "可信参考采集未完整完成，暂不依据不完整集合评 E/F"
+		result.Reason = "可信参考暂不可用: " + err.Error()
 	}
 	return err
 }
 
-// TTL=0 with disabled history, or expiry during a slow collection, must not let
-// a remaining subset of trusted sources become sufficient negative evidence.
-func referenceSourcesPresent(refs []model.Reference, sources []model.Server) bool {
-	present := make(map[int64]bool, len(refs))
+func hasUsableReference(refs []model.Reference, now int64, historyHours float64) bool {
 	for _, ref := range refs {
-		if len(ref.Records) > 0 {
-			present[ref.ServerID] = true
+		if !ref.Success || ref.Rcode != "NOERROR" {
+			continue
+		}
+		for _, record := range ref.Records {
+			if _, _, usable := referenceEligibility(record, now, historyHours); usable {
+				return true
+			}
 		}
 	}
-	for _, source := range sources {
-		if !present[source.ID] {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
 // Hash source identity rather than retaining long endpoint strings once per

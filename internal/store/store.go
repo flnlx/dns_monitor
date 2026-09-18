@@ -665,6 +665,10 @@ type accumulator struct {
 }
 
 func (a *accumulator) finish(window int64) model.Metrics {
+	return a.finishWithThresholds(window, 10, 30*60*1000)
+}
+
+func (a *accumulator) finishWithThresholds(window, minSamples, minCoverageMS int64) model.Metrics {
 	m := a.m
 	if a.covered > 0 {
 		m.Availability = 100 * a.available / a.covered
@@ -705,7 +709,7 @@ func (a *accumulator) finish(window int64) model.Metrics {
 		m.Score = 0
 	case a.pollution == 3:
 		m.Grade = "E"
-	case m.Samples < 10 || a.covered < 30*60*1000:
+	case m.Samples < minSamples || a.covered < float64(minCoverageMS):
 		m.Grade = "pending"
 	case m.Score >= 95:
 		m.Grade = "A"
@@ -730,6 +734,10 @@ func (s *Store) Summary(since, now int64) ([]model.ServerSummary, error) {
 		return append([]model.ServerSummary{}, s.cache...), nil
 	}
 	servers, err := s.ListServers()
+	if err != nil {
+		return nil, err
+	}
+	config, err := s.GetConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -787,6 +795,10 @@ func (s *Store) Summary(since, now int64) ([]model.ServerSummary, error) {
 	}
 	for _, v := range servers {
 		value := model.ServerSummary{Server: v, Metrics: acc[v.ID].finishForServer(now-since, v.Trusted)}
+		value.Current, err = s.currentEvaluation(v, config, now)
+		if err != nil {
+			return nil, err
+		}
 		err = s.db.QueryRow("SELECT finished_at,next_due,successes>0 FROM rounds WHERE server_id=? AND auxiliary=0 ORDER BY finished_at DESC,id DESC LIMIT 1", v.ID).Scan(&value.LastProbe, &value.NextDue, &value.LastSuccess)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err

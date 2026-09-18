@@ -85,33 +85,3 @@ func referenceEligibility(record model.AnswerRecord, now int64, historyHours flo
 	cutoff := now - int64(historyHours*float64(time.Hour/time.Millisecond))
 	return value, fresh, fresh || (historyHours > 0 && record.ObservedAt > cutoff)
 }
-
-// Collection and verdict evaluation can straddle a TTL boundary. Negative
-// evidence requires every collected source to remain eligible at ComparedAt,
-// which is exactly the same instant used for all address/prefix membership.
-func compareCollectionAt(result *model.ProbeResult, refs []model.Reference, complete bool, now int64, historyHours float64) {
-	compareAt(result, refs, now, historyHours)
-	if result.Pollution != "suspicious" && result.Pollution != "polluted" {
-		return
-	}
-	for _, ref := range refs {
-		usable := false
-		if ref.Success && ref.Rcode == "NOERROR" {
-			for _, record := range ref.Records {
-				_, _, eligible := referenceEligibility(record, now, historyHours)
-				if eligible {
-					usable = true
-					break
-				}
-			}
-		}
-		if !usable {
-			complete = false
-			break
-		}
-	}
-	if !complete {
-		result.Pollution = "unknown"
-		result.Reason = "可信参考未完整采集或有来源参考已过期，暂不依据不完整集合评 E/F"
-	}
-}

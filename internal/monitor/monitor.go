@@ -406,10 +406,6 @@ func (m *Monitor) release(serverID int64) {
 }
 
 func (m *Monitor) lookup(ctx context.Context, server model.Server, domain model.Domain, cfg model.Config, reference bool) (model.ProbeResult, error) {
-	return m.lookupMode(ctx, server, domain, cfg, reference, false)
-}
-
-func (m *Monitor) lookupMode(ctx context.Context, server model.Server, domain model.Domain, cfg model.Config, reference, force bool) (model.ProbeResult, error) {
 	key := cacheKey(server, domain)
 	cacheGet := func() (model.ProbeResult, bool) {
 		m.mu.Lock()
@@ -425,7 +421,7 @@ func (m *Monitor) lookupMode(ctx context.Context, server model.Server, domain mo
 		}
 		return v.result, valid
 	}
-	if reference && !force {
+	if reference {
 		if result, ok := cacheGet(); ok {
 			return result, nil
 		}
@@ -436,7 +432,7 @@ func (m *Monitor) lookupMode(ctx context.Context, server model.Server, domain mo
 	defer m.release(server.ID)
 	// A concurrent target/reference lookup may have populated the cache while
 	// waiting for the per-server gate. Recheck before spawning another process.
-	if reference && !force {
+	if reference {
 		if result, ok := cacheGet(); ok {
 			return result, nil
 		}

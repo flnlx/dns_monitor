@@ -40,7 +40,7 @@ func TestRoundPersistsAutomaticConvictionAndReference(t *testing.T) {
 		t.Fatalf("missing automatic conviction evidence: %+v", results[0])
 	}
 	references, err := st.Results(trusted.ID, 10, 0)
-	if err != nil || len(references) != 2 || references[0].Raw != "original evidence" {
+	if err != nil || len(references) != 1 || references[0].Raw != "original evidence" {
 		t.Fatalf("actual reference was lost: %+v %v", references, err)
 	}
 }

@@ -27,7 +27,7 @@ import (
 	"dnsmonitor/internal/winservice"
 )
 
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 type session struct{ expires time.Time }
 type Server struct {
@@ -268,7 +268,12 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, e)
 		return
 	}
-	jsonOut(w, 200, map[string]any{"points": points, "metrics": metrics})
+	current, e := s.Store.CurrentEvaluation(id, now)
+	if e != nil {
+		problem(w, 500, e)
+		return
+	}
+	jsonOut(w, 200, map[string]any{"points": points, "metrics": metrics, "current": current})
 }
 func (s *Server) results(w http.ResponseWriter, r *http.Request) {
 	id, e := idFrom(r)
@@ -310,8 +315,14 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, err)
 		return
 	}
-	// Older clients omit the new history setting; preserve their saved value.
-	cfg := model.Config{ReferenceHistoryHours: prior.ReferenceHistoryHours}
+	// Older clients omit newer settings; preserve their saved values. Decode
+	// explicit zero values normally so zero coverage remains a supported choice.
+	cfg := model.Config{
+		ReferenceHistoryHours:    prior.ReferenceHistoryHours,
+		RatingWindowMinutes:      prior.RatingWindowMinutes,
+		RatingMinSamples:         prior.RatingMinSamples,
+		RatingMinCoverageMinutes: prior.RatingMinCoverageMinutes,
+	}
 	if e := decode(w, r, &cfg); e != nil {
 		problem(w, 400, e)
 		return

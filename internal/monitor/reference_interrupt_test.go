@@ -8,7 +8,7 @@ import (
 	"dnsmonitor/internal/model"
 )
 
-func TestInterruptedReferenceCollectionCannotConvictPartialUnion(t *testing.T) {
+func TestInterruptedColdStartPreservesEvidenceAndResumesUsingAvailablePool(t *testing.T) {
 	for _, interruption := range []string{"pause", "stop"} {
 		t.Run(interruption, func(t *testing.T) {
 			st := testStore(t)
@@ -65,13 +65,13 @@ func TestInterruptedReferenceCollectionCannotConvictPartialUnion(t *testing.T) {
 				t.Fatalf("completed reference evidence not retained: %+v %v", refs, err)
 			}
 
-			// A complete retry must use both trusted answers and clear the transient unknown.
+			// Resume uses the completed observation immediately without collecting another source.
 			interrupt = false
 			m.config = cfg
 			m.runRound(context.Background(), servers[0], cfg, servers, 0)
 			results, err = st.Results(servers[0].ID, 10, 0)
-			if err != nil || len(results) != 2 || results[0].Pollution != "clean" || len(results[0].References) != 2 || secondCalls != 1 {
-				t.Fatalf("complete retry did not restore the full union: %+v %v", results, err)
+			if err != nil || len(results) != 2 || results[0].Pollution != "suspicious" || len(results[0].References) != 1 || secondCalls != 0 {
+				t.Fatalf("resume did not use the available pool immediately: %+v %v", results, err)
 			}
 		})
 	}

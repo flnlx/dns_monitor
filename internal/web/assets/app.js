@@ -3,7 +3,7 @@
 (() => {
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'average_ms', descending: false, detailID: null, history: [], results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null };
+  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'grade', descending: false, detailID: null, history: [], historyMetrics: null, results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null };
   const ranges = { '24h': 24 * 3600000, '7d': 7 * 86400000, '30d': 30 * 86400000 };
   const titles = { overview: ['监测总览', 'NETWORK OBSERVABILITY'], config: ['探测配置', 'MONITORING PREFERENCES'], service: ['Windows 服务', 'ALWAYS-ON MONITORING'], guide: ['使用指南', 'YOUR OBSERVATION HANDBOOK'] };
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -16,13 +16,44 @@
   const percent = (value, metrics, availability = false) => (availability ? hasCoverage(metrics) : hasSamples(metrics)) ? `${number(value)}%` : '—';
   const currentServer = () => state.data?.servers.find(server => server.id === state.detailID);
   const trustedResult = result => !!result.trusted || !!state.data?.servers.find(server => server.id === result.server_id)?.trusted;
-  const serverPollution = server => server.trusted ? 'clean' : server.metrics?.pollution;
+  const currentEvaluation = server => server?.current || {};
+  const serverPollution = server => server.trusted ? 'clean' : currentEvaluation(server).pollution;
   const displayedGrade = (metrics, trusted = false) => trusted && ['E', 'F'].includes(metrics?.grade) ? 'pending' : metrics?.grade;
-  const trustedBadge = '<span class="pollution-badge trusted">✓ 用户可信 / 无污染</span>';
+  const trustedBadge = '<span class="pollution-badge trusted" title="用户指定的可信 DNS，豁免污染判定；性能评级仍需足够采样。">✓ 用户可信 / 无污染</span>';
   const pollutionKind = value => ['matched', 'clean', 'suspicious', 'polluted'].includes(value) ? value : 'unknown';
   const pollutionLabel = value => ({ matched: '参考一致', clean: '正常', suspicious: '可疑', polluted: '疑似污染', unknown: '待判定' })[pollutionKind(value)];
-  const badge = (value, confirmed = false) => `<span class="pollution-badge ${pollutionKind(value)}"><span aria-hidden="true">${['polluted', 'suspicious'].includes(pollutionKind(value)) ? '!' : ['matched', 'clean'].includes(pollutionKind(value)) ? '✓' : '·'}</span>${confirmed && value === 'polluted' ? '已确认污染' : pollutionLabel(value)}</span>`;
-  const gradeHTML = value => ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? `<span class="grade grade-${value.toLowerCase()}" title="${({ A: '优秀', B: '良好', C: '一般', D: '较差', E: '可疑', F: '疑似或人工确认污染' })[value]}">${value}</span>` : '<span class="grade grade-pending">待评估</span>';
+  const pollutionHints = {
+    matched: '可比较的返回 IP 均命中 TTL 内的新鲜可信参考。',
+    clean: '可比较的返回 IP 命中有效可信历史，或已由用户手动标记正常。',
+    suspicious: '有 IP 未命中有效可信参考，但未命中的 IP 均与参考地址的前两段匹配。',
+    polluted: '有 IP 既未命中有效可信参考，前两段也不匹配；此为疑似判定。',
+    unknown: '查询失败、没有可比较的 IPv4 答案，或没有有效可信参考，暂无法判定。'
+  };
+  const badge = (value, confirmed = false) => `<span class="pollution-badge ${pollutionKind(value)}" title="${escape(confirmed && value === 'polluted' ? '用户已手动确认污染，可在域名菜单中修改判定。' : pollutionHints[pollutionKind(value)])}"><span aria-hidden="true">${['polluted', 'suspicious'].includes(pollutionKind(value)) ? '!' : ['matched', 'clean'].includes(pollutionKind(value)) ? '✓' : '·'}</span>${confirmed && value === 'polluted' ? '已确认污染' : pollutionLabel(value)}</span>`;
+  const gradeHints = {
+    A: '优秀：综合评分 ≥ 95，依据可用率、查询成功率和 P95 时延。',
+    B: '良好：综合评分 ≥ 85 且 < 95，依据可用率、查询成功率和 P95 时延。',
+    C: '一般：综合评分 ≥ 70 且 < 85，依据可用率、查询成功率和 P95 时延。',
+    D: '较差：综合评分 < 70，依据可用率、查询成功率和 P95 时延。',
+    E: '解析结果可疑，优先评 E；未命中的 IP 与可信参考的前两段匹配。',
+    F: '存在疑似或人工确认污染，优先评 F。',
+    pending: '等待足够的正式采样与有效覆盖；评级门槛可在探测配置中调整。'
+  };
+  const gradeHint = (value, evaluation = {}) => {
+    const description = gradeHints[value] || gradeHints.pending;
+    if (!evaluation.window_minutes) return description;
+    const prefix = `最近 ${integer(evaluation.window_minutes)} 分钟。`;
+    if (value !== 'pending' && gradeHints[value]) return prefix + description;
+    const reason = ({
+      no_samples: '评级窗口内没有正式采样，等待下一轮探测。',
+      quality_unknown: '最新正式探测的解析质量待判定，可查看域名记录中的原因。',
+      insufficient_samples: '正式采样次数尚未达到评级门槛。',
+      insufficient_coverage: '有效监测覆盖尚未达到评级门槛。'
+    })[evaluation.pending_reason] || description;
+    const covered = Math.floor((evaluation.covered_minutes || 0) * 10) / 10;
+    return `${prefix}${reason}采样 ${integer(evaluation.samples || 0)}/${integer(evaluation.min_samples)} 次，覆盖 ${number(covered)}/${integer(evaluation.min_coverage_minutes)} 分钟。`;
+  };
+  const gradeHTML = (value, evaluation) => ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? `<span class="grade grade-${value.toLowerCase()}" title="${escape(gradeHint(value, evaluation))}">${value}</span>` : `<span class="grade grade-pending" title="${escape(gradeHint('pending', evaluation))}">待评估</span>`;
 
   function setError(selector, message) {
     const element = $(selector);
@@ -141,6 +172,7 @@
       if ($('#detail-dialog').open) {
         renderDetailHeader();
         if ((currentServer()?.last_probe || 0) > previous) await Promise.allSettled([loadHistory(), loadResults(true)]);
+        else renderDetailCurrent();
       }
       return response;
     } catch (error) {
@@ -252,6 +284,7 @@
     ];
     $('#summary-cards').innerHTML = cards.map(card => `<article class="summary-card ${card.kind}"><div class="summary-top"><span>${escape(card.title)}</span><span class="summary-icon" aria-hidden="true">${escape(card.icon)}</span></div><div class="summary-value">${card.value}<small>${card.unit}</small></div><p class="summary-caption">${escape(card.caption)}</p></article>`).join('');
     $('#server-total').textContent = servers.length;
+    $('#rating-explanation').textContent = `时延、可用率和成功率按所选历史区间统计；当前解析质量取最新正式探测，当前评级使用最近 ${state.data.config?.rating_window_minutes ?? 60} 分钟。待判定时不延续旧的正常评级；点击域名可查看原因与人工复核。`;
     const selectedProtocol = $('#protocol-filter').value;
     const protocols = [...new Set(servers.map(server => server.protocol).filter(Boolean))].sort();
     $('#protocol-filter').innerHTML = `<option value="">全部协议</option>${protocols.map(protocol => `<option value="${escape(protocol)}">${escape(protocol.toUpperCase())}</option>`).join('')}`;
@@ -285,7 +318,7 @@
     const grade = $('#grade-filter').value;
     const servers = state.data.servers.filter(server => {
       const metrics = server.metrics || {};
-      const value = displayedGrade(metrics, server.trusted);
+      const value = displayedGrade(currentEvaluation(server), server.trusted);
       const gradeValue = ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? value : 'pending';
       return (!search || [server.name, server.provider, server.address].some(value => String(value || '').toLowerCase().includes(search))) && (!protocol || server.protocol === protocol) && (!pollution || pollutionKind(serverPollution(server)) === pollution) && (!grade || gradeValue === grade);
     });
@@ -294,8 +327,8 @@
       const rm = right.metrics || {};
       if (state.sort === 'grade') {
         const grades = ['A', 'B', 'C', 'D', 'E', 'F'];
-        const leftRank = grades.indexOf(displayedGrade(lm, left.trusted));
-        const rightRank = grades.indexOf(displayedGrade(rm, right.trusted));
+        const leftRank = grades.indexOf(displayedGrade(currentEvaluation(left), left.trusted));
+        const rightRank = grades.indexOf(displayedGrade(currentEvaluation(right), right.trusted));
         if (leftRank < 0 || rightRank < 0) return leftRank < 0 && rightRank < 0 ? left.id - right.id : leftRank < 0 ? 1 : -1;
         return (state.descending ? rightRank - leftRank : leftRank - rightRank) || left.id - right.id;
       }
@@ -312,10 +345,11 @@
     const servers = visibleServers();
     $('#server-rows').innerHTML = servers.map(server => {
       const metrics = server.metrics || {};
+      const evaluation = currentEvaluation(server);
       const known = !!server.last_probe;
       const statusClass = !server.enabled || !known ? 'unknown' : server.last_success ? '' : 'offline';
       const status = !server.enabled ? '已停用' : !known ? '待探测' : server.last_success ? '查询正常' : '查询异常';
-      return `<tr data-server-id="${server.id}"><td><button class="server-name-button" data-action="detail" data-id="${server.id}" title="查看 ${escape(server.name)} 的历史记录"><span class="server-avatar" aria-hidden="true">${escape((server.provider || server.name || 'D').slice(0, 1).toUpperCase())}</span><span><span class="server-name"><span class="name-text">${escape(server.name)}</span>${server.trusted ? '<span class="trusted-mark">可信</span>' : ''}</span><span class="server-secondary" title="${escape(server.address)}">${escape(server.provider || server.address)}</span></span></button></td><td title="最后探测：${escape(timestamp(server.last_probe, true))}"><span class="status-label ${statusClass}"><span class="status-dot"></span>${status}</span><div class="sub-status">${escape(relativeProbe(server))}</div></td><td><span class="protocol-badge">${escape((server.protocol || '—').toUpperCase())}</span></td><td><span class="latency-value">${hasLatency(metrics) ? number(metrics.average_ms, 0) : '—'}<small>ms</small></span></td><td>${rateCell(metrics.availability, metrics, true)}</td><td>${rateCell(metrics.success_rate, metrics)}</td><td>${server.trusted ? trustedBadge : badge(metrics.pollution)}</td><td>${gradeHTML(displayedGrade(metrics, server.trusted))}</td><td class="actions-cell"><div class="row-actions"><button class="row-action" data-action="edit" data-id="${server.id}" aria-label="编辑 ${escape(server.name)}">编辑</button><button class="row-action delete" data-action="delete" data-id="${server.id}" aria-label="删除 ${escape(server.name)}">删除</button></div></td></tr>`;
+      return `<tr data-server-id="${server.id}"><td><button class="server-name-button" data-action="detail" data-id="${server.id}" title="查看 ${escape(server.name)} 的历史记录"><span class="server-avatar" aria-hidden="true">${escape((server.provider || server.name || 'D').slice(0, 1).toUpperCase())}</span><span><span class="server-name"><span class="name-text">${escape(server.name)}</span>${server.trusted ? '<span class="trusted-mark">可信</span>' : ''}</span><span class="server-secondary" title="${escape(server.address)}">${escape(server.provider || server.address)}</span></span></button></td><td title="最后探测：${escape(timestamp(server.last_probe, true))}"><span class="status-label ${statusClass}"><span class="status-dot"></span>${status}</span><div class="sub-status">${escape(relativeProbe(server))}</div></td><td><span class="protocol-badge">${escape((server.protocol || '—').toUpperCase())}</span></td><td><span class="latency-value">${hasLatency(metrics) ? number(metrics.average_ms, 0) : '—'}<small>ms</small></span></td><td>${rateCell(metrics.availability, metrics, true)}</td><td>${rateCell(metrics.success_rate, metrics)}</td><td>${server.trusted ? trustedBadge : badge(evaluation.pollution)}</td><td>${gradeHTML(displayedGrade(evaluation, server.trusted), evaluation)}</td><td class="actions-cell"><div class="row-actions"><button class="row-action" data-action="edit" data-id="${server.id}" aria-label="编辑 ${escape(server.name)}">编辑</button><button class="row-action delete" data-action="delete" data-id="${server.id}" aria-label="删除 ${escape(server.name)}">删除</button></div></td></tr>`;
     }).join('');
     $('#servers-empty').hidden = servers.length > 0;
     if (!servers.length) {
@@ -418,11 +452,35 @@
     return row;
   }
 
+  function validateConfigNumber(input, showEmpty = false) {
+    input.setCustomValidity('');
+    const range = `${input.min}–${input.max} ${input.dataset.unit}`;
+    const validity = input.validity;
+    let message = '';
+    if (validity.badInput) message = `请输入 ${range} 范围内的数字。`;
+    else if (input.value.trim() === '' || validity.rangeUnderflow || validity.rangeOverflow) message = `请输入 ${range} 范围内的数值。`;
+    else if (validity.stepMismatch) message = input.step === '1' ? `请输入 ${range} 范围内的整数。` : `请输入 ${range} 范围内的数值，最多保留 1 位小数。`;
+    if (!message && input.name === 'rating_min_coverage_minutes') {
+      const window = $('#config-form').elements.rating_window_minutes;
+      if (window.value !== '' && window.validity.valid && input.valueAsNumber > window.valueAsNumber) message = `最小覆盖不能超过评级观察窗口（${window.value} 分钟）。`;
+    }
+    const visible = !!message && (showEmpty || input.value !== '' || validity.badInput);
+    input.setCustomValidity(message);
+    input.setAttribute('aria-invalid', String(visible));
+    input.closest('.input-unit').classList.toggle('invalid', visible);
+    const hint = $(`#${input.id}-error`);
+    hint.textContent = visible ? message : '';
+    hint.hidden = !visible;
+    if (input.name === 'rating_window_minutes') validateConfigNumber($('#config-form').elements.rating_min_coverage_minutes);
+    return !message;
+  }
+
   function populateConfig() {
     if (!state.data?.config) return;
     const form = $('#config-form');
     const config = state.data.config;
-    ['listen', 'interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours'].forEach(field => { form.elements[field].value = config[field] ?? ''; });
+    ['listen', 'interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours', 'rating_window_minutes', 'rating_min_samples', 'rating_min_coverage_minutes'].forEach(field => { form.elements[field].value = config[field] ?? ''; });
+    $$('#config-form input[type=number]').forEach(input => validateConfigNumber(input));
     form.elements.smart_backoff.checked = config.smart_backoff;
     $('#domain-rows').replaceChildren(...(config.domains || []).map(domainRow));
     if (!config.domains?.length) $('#domain-rows').append(domainRow());
@@ -441,8 +499,10 @@
   async function saveConfig(event) {
     event.preventDefault();
     const form = event.currentTarget;
+    $$('#config-form input[type=number]').forEach(input => validateConfigNumber(input, true));
+    if (!form.reportValidity()) return;
     const body = { listen: form.elements.listen.value.trim(), smart_backoff: form.elements.smart_backoff.checked, domains: $$('.domain-row').map(row => ({ name: $('.domain-name', row).value.trim(), type: $('.domain-type-select', row).value })) };
-    ['interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours'].forEach(field => { body[field] = Number(form.elements[field].value); });
+    ['interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours', 'rating_window_minutes', 'rating_min_samples', 'rating_min_coverage_minutes'].forEach(field => { body[field] = Number(form.elements[field].value); });
     const button = $('#save-config-button');
     button.disabled = true;
     setError('#config-error', '');
@@ -461,6 +521,7 @@
 
   async function openDetail(id) {
     state.detailID = id;
+    state.historyMetrics = null;
     state.detailRange = state.range;
     state.results = [];
     state.history = [];
@@ -491,6 +552,13 @@
     });
   }
 
+  function renderDetailCurrent(evaluation = currentEvaluation(currentServer())) {
+    const target = $('#detail-current-evaluation');
+    if (!target || !state.historyMetrics) return;
+    target.innerHTML = `<span>当前评级</span>${gradeHTML(displayedGrade(evaluation, currentServer()?.trusted), evaluation)}`;
+    $('#chart-note').textContent = `图表和性能指标按所选历史区间统计，空白表示未采样；区间内 ${integer(state.historyMetrics.samples || 0)} 次采样。当前解析质量：${currentServer()?.trusted ? '用户可信 / 无污染' : pollutionLabel(evaluation.pollution)}；当前评级窗口：最近 ${integer(evaluation.window_minutes || state.data?.config?.rating_window_minutes || 60)} 分钟。`;
+  }
+
   async function loadHistory() {
     const request = ++state.detailRequest;
     const id = state.detailID;
@@ -501,8 +569,10 @@
       if (request !== state.detailRequest || id !== state.detailID || range !== state.detailRange) return;
       state.history = (response.points || []).slice().sort((left, right) => left.timestamp - right.timestamp);
       const metrics = response.metrics || {};
-      $('#detail-metrics').innerHTML = `<div class="detail-metric"><span>可用率</span><strong>${percent(metrics.availability, metrics, true)}</strong></div><div class="detail-metric"><span>查询成功率</span><strong>${percent(metrics.success_rate, metrics)}</strong></div><div class="detail-metric"><span>P95 时延</span><strong>${hasLatency(metrics) ? number(metrics.p95_ms, 0) : '—'}<small>ms</small></strong></div><div class="detail-metric"><span>原始采样</span><strong>${integer(metrics.samples || 0)}<small>次</small></strong></div><div class="detail-metric"><span>时间覆盖率</span><strong>${hasSamples(metrics) ? number(metrics.coverage) + '%' : '—'}</strong></div><div class="detail-metric"><span>质量评级</span>${gradeHTML(displayedGrade(metrics, currentServer()?.trusted))}</div>`;
-      $('#chart-note').textContent = `图表按时间聚合，空白表示未采样；当前区间 ${integer(metrics.samples || 0)} 次采样，${currentServer()?.trusted ? '用户可信 / 无污染' : pollutionLabel(metrics.pollution)}。`;
+      state.historyMetrics = metrics;
+      const evaluation = response.current || currentEvaluation(currentServer());
+      $('#detail-metrics').innerHTML = `<div class="detail-metric"><span>可用率</span><strong>${percent(metrics.availability, metrics, true)}</strong></div><div class="detail-metric"><span>查询成功率</span><strong>${percent(metrics.success_rate, metrics)}</strong></div><div class="detail-metric"><span>P95 时延</span><strong>${hasLatency(metrics) ? number(metrics.p95_ms, 0) : '—'}<small>ms</small></strong></div><div class="detail-metric"><span>原始采样</span><strong>${integer(metrics.samples || 0)}<small>次</small></strong></div><div class="detail-metric"><span>时间覆盖率</span><strong>${hasSamples(metrics) ? number(metrics.coverage) + '%' : '—'}</strong></div><div class="detail-metric" id="detail-current-evaluation"></div>`;
+      renderDetailCurrent(evaluation);
       renderCharts();
     } catch (error) { if (request === state.detailRequest) setError('#detail-error', `历史读取失败：${error.message}`); }
   }
@@ -789,12 +859,13 @@
     const servers = visibleServers();
     const range = state.loadedRange || state.range;
     const snapshot = new Date(state.data?.now || Date.now()).toISOString();
-    const headers = ['名称', '供应商', '服务器地址', '协议', '当前状态', '平均时延(ms)', 'P95时延(ms)', '可用率(%)', '查询成功率(%)', '解析质量', '系统评级', '样本数', '覆盖率(%)', '最近探测时间(UTC)', '下次探测时间(UTC)', '统计区间', '数据快照时间(UTC)', '用户可信', '已启用'];
+    const headers = ['名称', '供应商', '服务器地址', '协议', '当前状态', '平均时延(ms)', 'P95时延(ms)', '可用率(%)', '查询成功率(%)', '当前解析质量', '当前评级', '历史区间样本数', '覆盖率(%)', '最近探测时间(UTC)', '下次探测时间(UTC)', '统计区间', '数据快照时间(UTC)', '用户可信', '已启用', '评级窗口(分钟)', '评级正式采样数', '评级有效覆盖(分钟)', '近期性能评分', '评级说明'];
     const rows = servers.map(server => {
       const metrics = server.metrics || {};
       const status = !server.enabled ? '已停用' : !server.last_probe ? '待探测' : server.last_success ? '查询正常' : '查询异常';
-      const grade = displayedGrade(metrics, server.trusted);
-      return [server.name, server.provider, server.address, server.protocol, status, hasLatency(metrics) ? metrics.average_ms : '', hasLatency(metrics) ? metrics.p95_ms : '', hasCoverage(metrics) ? metrics.availability : '', hasSamples(metrics) ? metrics.success_rate : '', server.trusted ? '用户可信 / 无污染' : pollutionLabel(metrics.pollution), ['A', 'B', 'C', 'D', 'E', 'F'].includes(grade) ? grade : '待评估', metrics.samples || 0, metrics.coverage || 0, server.last_probe ? new Date(server.last_probe).toISOString() : '', server.next_due ? new Date(server.next_due).toISOString() : '', range, snapshot, server.trusted ? '是' : '否', server.enabled ? '是' : '否'];
+      const evaluation = currentEvaluation(server);
+      const grade = displayedGrade(evaluation, server.trusted);
+      return [server.name, server.provider, server.address, server.protocol, status, hasLatency(metrics) ? metrics.average_ms : '', hasLatency(metrics) ? metrics.p95_ms : '', hasCoverage(metrics) ? metrics.availability : '', hasSamples(metrics) ? metrics.success_rate : '', server.trusted ? '用户可信 / 无污染' : pollutionLabel(evaluation.pollution), ['A', 'B', 'C', 'D', 'E', 'F'].includes(grade) ? grade : '待评估', metrics.samples || 0, metrics.coverage || 0, server.last_probe ? new Date(server.last_probe).toISOString() : '', server.next_due ? new Date(server.next_due).toISOString() : '', range, snapshot, server.trusted ? '是' : '否', server.enabled ? '是' : '否', evaluation.window_minutes ?? '', evaluation.samples ?? '', evaluation.covered_minutes ?? '', evaluation.score ?? '', gradeHint(grade, evaluation)];
     });
     return { text: '\uFEFF' + [headers, ...rows].map(row => row.map(summaryCSVCell).join(',')).join('\r\n') + '\r\n', count: servers.length, range };
   }
@@ -1027,8 +1098,20 @@
   $$('[data-close]').forEach(button => button.addEventListener('click', () => $(`#${button.dataset.close}`).close()));
   $('#confirm-cancel').addEventListener('click', () => $('#confirm-dialog').close('cancel'));
   $('#confirm-ok').addEventListener('click', () => $('#confirm-dialog').close('confirm'));
-  $('#config-form').addEventListener('input', markConfigDirty);
-  $('#config-form').addEventListener('change', markConfigDirty);
+  $('#config-form').addEventListener('input', event => {
+    markConfigDirty();
+    if (event.target.matches('input[type=number]')) validateConfigNumber(event.target);
+  });
+  $('#config-form').addEventListener('change', event => {
+    markConfigDirty();
+    if (event.target.matches('input[type=number]')) validateConfigNumber(event.target, true);
+  });
+  $('#config-form').addEventListener('focusout', event => {
+    if (event.target.matches('input[type=number]')) validateConfigNumber(event.target, true);
+  });
+  $('#config-form').addEventListener('invalid', event => {
+    if (event.target.matches('input[type=number]')) validateConfigNumber(event.target, true);
+  }, true);
   $('#config-form').addEventListener('submit', saveConfig);
   $('#add-domain-button').addEventListener('click', () => { const row = domainRow(); $('#domain-rows').append(row); $('.domain-name', row).focus(); markConfigDirty(); });
   $('#domain-rows').addEventListener('click', event => {

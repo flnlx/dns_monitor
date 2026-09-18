@@ -3,15 +3,18 @@ package model
 import "time"
 
 type Config struct {
-	Listen                string   `json:"listen"`
-	IntervalSeconds       int      `json:"interval_seconds"`
-	TimeoutSeconds        int      `json:"timeout_seconds"`
-	Concurrency           int      `json:"concurrency"`
-	SmartBackoff          bool     `json:"smart_backoff"`
-	MaxBackoffHours       float64  `json:"max_backoff_hours"`
-	ReferenceTTLSeconds   int      `json:"reference_ttl_seconds"`
-	ReferenceHistoryHours float64  `json:"reference_history_hours"`
-	Domains               []Domain `json:"domains"`
+	Listen                   string   `json:"listen"`
+	IntervalSeconds          int      `json:"interval_seconds"`
+	TimeoutSeconds           int      `json:"timeout_seconds"`
+	Concurrency              int      `json:"concurrency"`
+	SmartBackoff             bool     `json:"smart_backoff"`
+	MaxBackoffHours          float64  `json:"max_backoff_hours"`
+	ReferenceTTLSeconds      int      `json:"reference_ttl_seconds"`
+	ReferenceHistoryHours    float64  `json:"reference_history_hours"`
+	RatingWindowMinutes      int      `json:"rating_window_minutes"`
+	RatingMinSamples         int      `json:"rating_min_samples"`
+	RatingMinCoverageMinutes int      `json:"rating_min_coverage_minutes"`
+	Domains                  []Domain `json:"domains"`
 }
 type Domain struct {
 	Name string `json:"name"`
@@ -19,7 +22,7 @@ type Domain struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, ReferenceHistoryHours: 1, Domains: []Domain{{Name: "www.youtube.com", Type: "A"}}}
+	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, ReferenceHistoryHours: 1, RatingWindowMinutes: 60, RatingMinSamples: 3, RatingMinCoverageMinutes: 5, Domains: []Domain{{Name: "www.youtube.com", Type: "A"}}}
 }
 
 type Server struct {
@@ -104,13 +107,23 @@ type Metrics struct {
 	Grade        string  `json:"grade"`
 	Score        float64 `json:"score"`
 }
+type CurrentEvaluation struct {
+	Metrics
+	WindowMinutes      int     `json:"window_minutes"`
+	MinSamples         int     `json:"min_samples"`
+	MinCoverageMinutes int     `json:"min_coverage_minutes"`
+	CoveredMinutes     float64 `json:"covered_minutes"`
+	QualityAt          int64   `json:"quality_at"`
+	PendingReason      string  `json:"pending_reason"`
+}
 type ServerSummary struct {
 	Server
-	Metrics     Metrics `json:"metrics"`
-	LastProbe   int64   `json:"last_probe"`
-	NextDue     int64   `json:"next_due"`
-	LastSuccess bool    `json:"last_success"`
-	Failures    int     `json:"failures"`
+	Current     CurrentEvaluation `json:"current"`
+	Metrics     Metrics           `json:"metrics"`
+	LastProbe   int64             `json:"last_probe"`
+	NextDue     int64             `json:"next_due"`
+	LastSuccess bool              `json:"last_success"`
+	Failures    int               `json:"failures"`
 }
 type HistoryPoint struct {
 	Timestamp int64 `json:"timestamp"`

@@ -122,7 +122,7 @@ func TestReferenceHistoryConfig(t *testing.T) {
 	}
 }
 
-func TestSharedRecheckBudgetAndRotation(t *testing.T) {
+func TestSharedColdStartUsesExistingPoolWithoutRecheck(t *testing.T) {
 	st := testStore(t)
 	source, err := st.SaveServer(model.Server{Name: "trusted", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
 	if err != nil {
@@ -155,7 +155,7 @@ func TestSharedRecheckBudgetAndRotation(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if calls.Load() != 2 || maxActive.Load() > int32(cfg.Concurrency) {
+	if calls.Load() != 1 || maxActive.Load() > int32(cfg.Concurrency) {
 		t.Fatalf("shared budget exceeded: %d calls %d active", calls.Load(), maxActive.Load())
 	}
 	m.mu.Lock()
@@ -165,8 +165,8 @@ func TestSharedRecheckBudgetAndRotation(t *testing.T) {
 	if err := m.classify(context.Background(), &r, domain, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 3 {
-		t.Fatal("forced cooldown bypassed", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatal("existing pool triggered redundant collection", calls.Load())
 	}
 	// A separate domain cannot inherit another domain's observed pool.
 	other := model.Domain{Name: "other.example", Type: "A"}
@@ -187,36 +187,82 @@ func TestSharedRecheckBudgetAndRotation(t *testing.T) {
 	}
 }
 
-func TestRecheckCollectsRotatingAnswerAndFailedSourceCannotConvict(t *testing.T) {
-	for _, fail := range []bool{false, true} {
-		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+func TestExistingPoolClassifiesWithoutOfflineSourceOrForcedRecheck(t *testing.T) {
+	st := testStore(t)
+	source, err := st.SaveServer(model.Server{Name: "trusted", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.SaveServer(model.Server{Name: "offline", Address: "udp://192.0.2.2", Enabled: true, Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.DefaultConfig()
+	domain := cfg.Domains[0]
+	now := time.Now().UnixMilli()
+	history := fakeResult(source, domain)
+	history.Records = []model.AnswerRecord{{Value: "192.0.2.8", TTLSeconds: 1, ObservedAt: now - 60000, ExpiresAt: now - 59000}, {Value: "192.0.2.9", TTLSeconds: 60, ObservedAt: now, ExpiresAt: now + 60000}}
+	if err := st.SaveTrustedObservation(source, history); err != nil {
+		t.Fatal(err)
+	}
+	m := New(st, "")
+	m.probe = func(_ context.Context, _ string, _ model.Server, _ model.Domain, _ time.Duration) model.ProbeResult {
+		t.Error("existing pool must not query any reference, including the offline source")
+		return model.ProbeResult{}
+	}
+	for _, test := range []struct{ answer, want string }{
+		{"192.0.2.9", "matched"}, {"192.0.2.8", "clean"},
+		{"192.0.100.1", "suspicious"}, {"198.51.100.1", "polluted"},
+	} {
+		r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{test.answer}}
+		if err := m.classify(context.Background(), &r, domain, cfg); err != nil || r.Pollution != test.want {
+			t.Fatalf("want %s: %+v %v", test.want, r, err)
+		}
+	}
+}
+
+func TestColdStartStopsAtFirstUsableSourceAndRateLimitsEmptyPool(t *testing.T) {
+	for _, usable := range []bool{false, true} {
+		t.Run(fmt.Sprint(usable), func(t *testing.T) {
 			st := testStore(t)
-			_, err := st.SaveServer(model.Server{Name: "trusted", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
-			if err != nil {
-				t.Fatal(err)
+			for i := 1; i <= 3; i++ {
+				if _, err := st.SaveServer(model.Server{Name: fmt.Sprint(i), Address: fmt.Sprintf("udp://192.0.2.%d", i), Enabled: true, Trusted: true}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			m := New(st, "")
-			cfg := model.DefaultConfig()
-			calls := 0
+			var calls atomic.Int32
 			m.probe = func(_ context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
-				calls++
+				calls.Add(1)
 				r := fakeResult(s, d)
-				if calls > 1 {
-					r.Answers = []string{"198.51.100.1"}
-					r.Success = !fail
+				r.Success = usable && s.ID == 2
+				if !r.Success {
+					r.Answers = nil
+					r.Error = "timeout"
 				}
 				return r
 			}
-			r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
-			if err := m.classify(context.Background(), &r, cfg.Domains[0], cfg); err != nil {
-				t.Fatal(err)
+			var wg sync.WaitGroup
+			for i := 0; i < 20; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
+					want := "unknown"
+					if usable {
+						want = "polluted"
+					}
+					if err := m.classify(context.Background(), &r, m.config.Domains[0], m.config); err != nil || r.Pollution != want {
+						t.Errorf("want %s: %+v %v", want, r, err)
+					}
+				}()
 			}
-			want := "clean"
-			if fail {
-				want = "unknown"
+			wg.Wait()
+			wantCalls := int32(3)
+			if usable {
+				wantCalls = 2
 			}
-			if r.Pollution != want || calls != 2 {
-				t.Fatalf("want %s: %+v calls=%d", want, r, calls)
+			if calls.Load() != wantCalls {
+				t.Fatalf("shared cold-start queried %d times, want %d", calls.Load(), wantCalls)
 			}
 		})
 	}
@@ -299,7 +345,7 @@ func TestFailedObservationWriteCannotConvict(t *testing.T) {
 	}
 }
 
-func TestPartialEligibleSourcePoolCannotConvict(t *testing.T) {
+func TestPartialEligibleSourcePoolCanClassify(t *testing.T) {
 	st := testStore(t)
 	sources := make([]model.Server, 2)
 	for i := range sources {
@@ -320,8 +366,8 @@ func TestPartialEligibleSourcePoolCannotConvict(t *testing.T) {
 		return r
 	}
 	r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
-	if err := m.classify(context.Background(), &r, cfg.Domains[0], cfg); err != nil || r.Pollution != "unknown" {
-		t.Fatalf("partial TTL-eligible source set convicted: %+v %v", r, err)
+	if err := m.classify(context.Background(), &r, cfg.Domains[0], cfg); err != nil || r.Pollution != "polluted" {
+		t.Fatalf("partial TTL-eligible source set did not classify: %+v %v", r, err)
 	}
 }
 
@@ -352,7 +398,7 @@ func TestNewMonitorUsesPersistedHistoryDuringReferenceFailure(t *testing.T) {
 	}
 }
 
-func TestRefreshDuringCollectionCannotConvictUsingRemainingHistory(t *testing.T) {
+func TestRefreshDuringEmptyPoolCollectionPreservesEvidenceAndRetries(t *testing.T) {
 	st := testStore(t)
 	source, err := st.SaveServer(model.Server{Name: "trusted", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
 	if err != nil {
@@ -360,12 +406,6 @@ func TestRefreshDuringCollectionCannotConvictUsingRemainingHistory(t *testing.T)
 	}
 	m := New(st, "")
 	domain := m.config.Domains[0]
-	now := time.Now().UnixMilli()
-	old := fakeResult(source, domain)
-	old.Records = []model.AnswerRecord{{Value: old.Answers[0], ObservedAt: now, ExpiresAt: now}}
-	if err := st.SaveTrustedObservation(source, old); err != nil {
-		t.Fatal(err)
-	}
 	started, release := make(chan struct{}), make(chan struct{})
 	calls := 0
 	m.probe = func(_ context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
@@ -387,14 +427,18 @@ func TestRefreshDuringCollectionCannotConvictUsingRemainingHistory(t *testing.T)
 	}
 	close(release)
 	if err := <-finished; err == nil || result.Pollution != "unknown" || calls != 1 {
-		t.Fatalf("old generation convicted from remaining pool: %+v %v calls=%d", result, err, calls)
+		t.Fatalf("old generation entered the reference pool: %+v %v calls=%d", result, err, calls)
+	}
+	raw, err := st.Results(source.ID, 10, 0)
+	if err != nil || len(raw) != 1 {
+		t.Fatal("completed old-generation evidence lost", raw, err)
 	}
 	if err := m.classify(context.Background(), &result, domain, m.config); err != nil || result.Pollution != "clean" || calls != 2 {
 		t.Fatalf("fresh collection not restored: %+v %v calls=%d", result, err, calls)
 	}
 }
 
-func TestExpiryBetweenCollectionAndComparisonCannotConvictPartialSources(t *testing.T) {
+func TestExpiryBetweenReadAndComparisonUsesRemainingEligibleSources(t *testing.T) {
 	observed := time.Now().UnixMilli()
 	a := referenceFixture(observed, 1, 0, "57.144.152.1")
 	b := referenceFixture(observed, 60, 0, "198.51.100.1")
@@ -406,14 +450,15 @@ func TestExpiryBetweenCollectionAndComparisonCannotConvictPartialSources(t *test
 		answer, want string
 	}{
 		{"before expiry", observed + 999, 0, "57.144.152.1", "matched"},
-		{"at expiry", observed + 1000, 0, "57.144.152.1", "unknown"},
-		{"after expiry", observed + 1001, 0, "57.144.152.1", "unknown"},
-		{"partial set cannot E", observed + 1001, 0, "198.51.100.2", "unknown"},
+		{"at expiry", observed + 1000, 0, "57.144.152.1", "polluted"},
+		{"after expiry", observed + 1001, 0, "57.144.152.1", "polluted"},
+		{"partial set can E", observed + 1001, 0, "198.51.100.2", "suspicious"},
+		{"all expired", observed + 60000, 0, "198.51.100.2", "unknown"},
 		{"history keeps source usable", observed + 1001, 1, "57.144.152.1", "clean"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{test.answer}}
-			compareCollectionAt(&r, []model.Reference{a, b}, true, test.at, test.history)
+			compareAt(&r, []model.Reference{a, b}, test.at, test.history)
 			if r.Pollution != test.want || r.ComparedAt != test.at {
 				t.Fatalf("want %s: %+v", test.want, r)
 			}
@@ -421,7 +466,7 @@ func TestExpiryBetweenCollectionAndComparisonCannotConvictPartialSources(t *test
 	}
 }
 
-func TestTrustedSourceAddedDuringForcedCollectionDefersVerdict(t *testing.T) {
+func TestTrustedSourceAddedDuringColdStartDoesNotDelayVerdict(t *testing.T) {
 	st := testStore(t)
 	source, err := st.SaveServer(model.Server{Name: "first", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
 	if err != nil {
@@ -429,12 +474,12 @@ func TestTrustedSourceAddedDuringForcedCollectionDefersVerdict(t *testing.T) {
 	}
 	m := New(st, "")
 	domain := m.config.Domains[0]
-	forced, release := make(chan struct{}), make(chan struct{})
+	started, release := make(chan struct{}), make(chan struct{})
 	calls := 0
 	m.probe = func(_ context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
 		calls++
-		if calls == 2 {
-			close(forced)
+		if calls == 1 {
+			close(started)
 			<-release
 		}
 		r := fakeResult(s, d)
@@ -446,15 +491,168 @@ func TestTrustedSourceAddedDuringForcedCollectionDefersVerdict(t *testing.T) {
 	r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
 	finished := make(chan error, 1)
 	go func() { finished <- m.classify(context.Background(), &r, domain, m.config) }()
-	<-forced
+	<-started
 	if _, err := st.SaveServer(model.Server{Name: "new trusted", Address: "udp://192.0.2.2", Enabled: true, Trusted: true}); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
-	if err := <-finished; err == nil || r.Pollution != "unknown" {
-		t.Fatalf("new trusted source omitted from conviction: %+v %v", r, err)
+	if err := <-finished; err != nil || r.Pollution != "polluted" || calls != 1 {
+		t.Fatalf("new trusted source blocked existing usable reference: %+v %v", r, err)
 	}
-	if err := m.classify(context.Background(), &r, domain, m.config); err != nil || r.Pollution != "clean" || len(r.References) != 2 {
-		t.Fatalf("new complete source set not collected: %+v %v", r, err)
+	if err := m.classify(context.Background(), &r, domain, m.config); err != nil || r.Pollution != "polluted" || len(r.References) != 1 || calls != 1 {
+		t.Fatalf("existing pool unnecessarily waited for newly added source: %+v %v", r, err)
+	}
+}
+
+func TestReferenceReadFailureCannotClassifyOrTriggerCollection(t *testing.T) {
+	st := testStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := New(st, "")
+	m.probe = func(_ context.Context, _ string, _ model.Server, _ model.Domain, _ time.Duration) model.ProbeResult {
+		t.Error("reference read error must not be treated as a cold empty pool")
+		return model.ProbeResult{}
+	}
+	r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
+	if err := m.classify(context.Background(), &r, m.config.Domains[0], m.config); err == nil || r.Pollution != "unknown" {
+		t.Fatalf("read error allowed comparison: %+v %v", r, err)
+	}
+}
+
+func TestRevokedExistingPoolCannotBeUsedFromLookupCache(t *testing.T) {
+	st := testStore(t)
+	source, err := st.SaveServer(model.Server{Name: "trusted", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(st, "")
+	calls := 0
+	m.probe = func(_ context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
+		calls++
+		r := fakeResult(s, d)
+		r.Records = []model.AnswerRecord{{Value: r.Answers[0], TTLSeconds: 60}}
+		return r
+	}
+	if _, err := m.lookup(context.Background(), source, m.config.Domains[0], m.config, true); err != nil {
+		t.Fatal(err)
+	}
+	source.Trusted = false
+	if _, err := st.SaveServer(source); err != nil {
+		t.Fatal(err)
+	}
+	r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"198.51.100.1"}}
+	if err := m.classify(context.Background(), &r, m.config.Domains[0], m.config); err != nil || r.Pollution != "unknown" || len(r.References) != 0 || calls != 1 {
+		t.Fatalf("revoked pool survived through cache: %+v %v calls=%d", r, err, calls)
+	}
+}
+
+func TestColdStartWaitersUseNewScheduledReferenceBeforeSlowCollectorFinishes(t *testing.T) {
+	st := testStore(t)
+	slow, err := st.SaveServer(model.Server{Name: "slow", Address: "udp://192.0.2.1", Enabled: true, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast, err := st.SaveServer(model.Server{Name: "fast", Address: "udp://192.0.2.2", Enabled: true, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(st, "")
+	domain := m.config.Domains[0]
+	started, release, ownerDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	var calls atomic.Int32
+	m.probe = func(ctx context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
+		calls.Add(1)
+		r := fakeResult(s, d)
+		r.Raw = "completed reference evidence"
+		if s.ID == slow.ID {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			r.Answers = []string{"192.0.2.10"}
+		} else {
+			r.Answers = []string{"192.0.2.20"}
+		}
+		return r
+	}
+	type verdict struct {
+		result model.ProbeResult
+		err    error
+	}
+	classify := func(ctx context.Context) verdict {
+		r := model.ProbeResult{Type: "A", Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.20"}}
+		err := m.classify(ctx, &r, domain, m.config)
+		return verdict{r, err}
+	}
+	owner := make(chan verdict, 1)
+	go func() { defer close(ownerDone); owner <- classify(context.Background()) }()
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); <-ownerDone })
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cold-start collector did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	const waiterCount = 4
+	waiting := make(chan struct{}, waiterCount)
+	finished := make(chan verdict, waiterCount)
+	var wg sync.WaitGroup
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	for i := 0; i < waiterCount; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); waiting <- struct{}{}; finished <- classify(ctx) }()
+	}
+	for i := 0; i < waiterCount; i++ {
+		<-waiting
+	}
+	// With an empty pool, waiters must join the in-flight collection. Leave it
+	// blocked while an ordinary scheduled probe supplies a different source.
+	select {
+	case v := <-finished:
+		t.Fatalf("empty pool returned before reference: %+v", v)
+	case <-time.After(20 * time.Millisecond):
+	}
+	m.runRound(context.Background(), fast, m.config, []model.Server{slow, fast}, 0)
+	for i := 0; i < waiterCount; i++ {
+		select {
+		case v := <-finished:
+			if v.err != nil || v.result.Pollution != "clean" || len(v.result.References) != 1 || v.result.References[0].ServerID != fast.ID {
+				t.Fatalf("waiter missed newly available reference: %+v", v)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("waiter remained blocked by slow collector after scheduled source filled pool")
+		}
+	}
+	select {
+	case v := <-owner:
+		t.Fatalf("slow collector unexpectedly finished: %+v", v)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case v := <-owner:
+		if v.err != nil || v.result.Pollution != "clean" || len(v.result.References) != 2 {
+			t.Fatalf("collector lost final union: %+v", v)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collector did not finish after release")
+	}
+	<-ownerDone
+	if calls.Load() != 2 {
+		t.Fatal("waiters issued redundant probes", calls.Load())
+	}
+	raw, err := st.Results(slow.ID, 10, 0)
+	if err != nil || len(raw) != 1 || raw[0].Raw != "completed reference evidence" {
+		t.Fatal("slow collector evidence lost", raw, err)
+	}
+	m.mu.Lock()
+	collecting := m.referenceCollections[domain.Name+"\x00"+domain.Type].done != nil
+	m.mu.Unlock()
+	if collecting {
+		t.Fatal("finished collector left shared state open")
 	}
 }
