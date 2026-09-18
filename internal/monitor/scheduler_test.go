@@ -22,7 +22,7 @@ func TestRoundPersistsAutomaticConvictionAndReference(t *testing.T) {
 	}
 	m := New(st, "")
 	m.probe = func(_ context.Context, _ string, s model.Server, d model.Domain, _ time.Duration) model.ProbeResult {
-		answer := "192.0.2.100"
+		answer := "198.51.100.100"
 		if s.ID == trusted.ID {
 			answer = "192.0.2.200"
 		}
@@ -40,7 +40,7 @@ func TestRoundPersistsAutomaticConvictionAndReference(t *testing.T) {
 		t.Fatalf("missing automatic conviction evidence: %+v", results[0])
 	}
 	references, err := st.Results(trusted.ID, 10, 0)
-	if err != nil || len(references) != 1 || references[0].Raw != "original evidence" {
+	if err != nil || len(references) != 2 || references[0].Raw != "original evidence" {
 		t.Fatalf("actual reference was lost: %+v %v", references, err)
 	}
 }

@@ -156,6 +156,9 @@ func ValidateConfig(c *model.Config) error {
 	if c.ReferenceTTLSeconds < 0 || c.ReferenceTTLSeconds > 86400 {
 		return errors.New("可信参考缓存范围为 0–86400 秒，0 表示不使用缓存")
 	}
+	if math.IsNaN(c.ReferenceHistoryHours) || math.IsInf(c.ReferenceHistoryHours, 0) || c.ReferenceHistoryHours < 0 || c.ReferenceHistoryHours > 720 {
+		return errors.New("可信近期历史范围为 0–720 小时，0 表示关闭历史参考")
+	}
 	if len(c.Domains) == 0 || len(c.Domains) > 100 {
 		return errors.New("请配置 1–100 个探测域名")
 	}

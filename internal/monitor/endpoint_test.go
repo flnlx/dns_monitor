@@ -33,7 +33,7 @@ func TestSameEndpointDefaultPortAliases(t *testing.T) {
 	}
 }
 
-func TestDefaultPortAliasCannotTrustItself(t *testing.T) {
+func TestExplicitTrustedAliasContributesToUnion(t *testing.T) {
 	st := testStore(t)
 	cfg := model.DefaultConfig()
 	cfg.Domains = []model.Domain{{Name: "example.com", Type: "A"}}
@@ -56,7 +56,7 @@ func TestDefaultPortAliasCannotTrustItself(t *testing.T) {
 	if err != nil || len(results) != 1 {
 		t.Fatalf("results=%v err=%v", results, err)
 	}
-	if calls != 1 || len(results[0].References) != 0 || results[0].Pollution != "unknown" {
-		t.Fatalf("server trusted its own default-port alias: calls=%d result=%+v", calls, results[0])
+	if calls != 2 || len(results[0].References) != 1 || results[0].Pollution != "clean" {
+		t.Fatalf("explicitly trusted default-port alias was excluded from union: calls=%d result=%+v", calls, results[0])
 	}
 }

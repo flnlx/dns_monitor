@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,12 +37,13 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 type doggoRecord struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Address string `json:"address"`
-	MName   string `json:"mname"`
-	Status  string `json:"status"`
-	RTT     string `json:"rtt"`
+	Name    string          `json:"name"`
+	Type    string          `json:"type"`
+	Address string          `json:"address"`
+	MName   string          `json:"mname"`
+	Status  string          `json:"status"`
+	RTT     string          `json:"rtt"`
+	TTL     json.RawMessage `json:"ttl"`
 }
 type doggoOutput struct {
 	Responses []struct {
@@ -78,7 +79,7 @@ func doggoArgs(server model.Server, domain model.Domain, timeout time.Duration) 
 
 func runDoggo(ctx context.Context, path string, server model.Server, domain model.Domain, timeout time.Duration) model.ProbeResult {
 	started := time.Now()
-	result := model.ProbeResult{ServerID: server.ID, Timestamp: started.UnixMilli(), Domain: domain.Name, Type: domain.Type, Pollution: "unknown", Reason: "尚未与可信 DNS 比较", Answers: []string{}, References: []model.Reference{}}
+	result := model.ProbeResult{ServerID: server.ID, Timestamp: started.UnixMilli(), Domain: domain.Name, Type: domain.Type, PolicyVersion: 2, Pollution: "unknown", Reason: "尚未与可信 DNS 比较", Answers: []string{}, References: []model.Reference{}}
 	// Hard deadline also covers resolver bootstrap and process startup. CommandContext
 	// terminates the actual executable directly; no shell or command interpolation.
 	probeCtx, cancel := context.WithTimeout(ctx, timeout+2*time.Second)
@@ -100,6 +101,7 @@ func runDoggo(ctx context.Context, path string, server model.Server, domain mode
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	result.Timestamp = time.Now().UnixMilli()
 	result.LatencyMS = float64(time.Since(started).Microseconds()) / 1000
 	result.Raw = stdout.String()
 	if stderr.Len() > 0 {
@@ -125,6 +127,7 @@ func runDoggo(ctx context.Context, path string, server model.Server, domain mode
 	result.Success = parsed.Success
 	result.Rcode = parsed.Rcode
 	result.Answers = parsed.Answers
+	result.Records = parsed.Records
 	if parsed.LatencyMS >= 0 {
 		result.LatencyMS = parsed.LatencyMS
 	}
@@ -172,13 +175,10 @@ func decodeDoggo(data []byte, domain model.Domain) (model.ProbeResult, error) {
 			}
 		}
 	}
-	for _, record := range resp.Answers {
-		if strings.EqualFold(record.Type, domain.Type) {
-			value := normalizeAnswer(domain.Type, record.Address)
-			if value != "" {
-				r.Answers = append(r.Answers, value)
-			}
-		}
+	r.Timestamp = time.Now().UnixMilli()
+	r.Records = requestedRecords(resp.Answers, domain, r.Timestamp)
+	for _, record := range r.Records {
+		r.Answers = append(r.Answers, record.Value)
 	}
 	sort.Strings(r.Answers)
 	r.Answers = unique(r.Answers)
@@ -247,44 +247,93 @@ func unique(in []string) []string {
 	return in[:n]
 }
 
-func compare(result *model.ProbeResult, refs []model.Reference) {
-	result.References = refs
-	result.Pollution = "unknown"
-	result.Reason = "没有成功的可信 DNS 参考回答"
-	if !result.Success {
-		result.Reason = "目标查询未得到可比较结果"
-		return
+// Unknown, fractional and negative TTLs never become fresh evidence. One day is
+// a conservative upper bound against malformed upstream lifetimes, not a claim
+// that DNS itself limits TTLs to one day.
+func recordTTL(raw json.RawMessage) int64 {
+	if len(raw) == 0 {
+		return 0
 	}
-	var expected string
-	count := 0
-	for _, ref := range refs {
-		if !ref.Success || (ref.Rcode != "NOERROR" && ref.Rcode != "NXDOMAIN") || (ref.Rcode == "NOERROR" && len(ref.Answers) == 0) {
-			continue
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		if d, err := time.ParseDuration(value); err == nil {
+			if d <= 0 || d%time.Second != 0 {
+				return 0
+			}
+			seconds := int64(d / time.Second)
+			if seconds > 86400 {
+				return 86400
+			}
+			return seconds
 		}
-		key := answerKey(ref.Rcode, ref.Answers)
-		if count > 0 && key != expected {
-			result.Pollution = "unknown"
-			result.Reason = "可信 DNS 之间回答不一致，暂停自动定罪"
-			return
-		}
-		expected = key
-		count++
+	} else {
+		value = string(raw)
 	}
-	if count == 0 {
-		return
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds <= 0 {
+		return 0
 	}
-	if answerKey(result.Rcode, result.Answers) == expected {
-		result.Pollution = "clean"
-		result.Reason = fmt.Sprintf("与 %d 个成功可信 DNS 的回答一致", count)
-		return
+	if seconds > 86400 {
+		return 86400
 	}
-	result.Pollution = "polluted"
-	result.Reason = fmt.Sprintf("与 %d 个回答一致的可信 DNS 不同，按配置自动定罪；可通过域名菜单撤销", count)
+	return seconds
 }
 
-func answerKey(rcode string, answers []string) string {
-	a := append([]string(nil), answers...)
-	sort.Strings(a)
-	a = unique(a)
-	return rcode + "\x00" + strings.Join(a, "\x00")
+func requestedRecords(answers []doggoRecord, domain model.Domain, now int64) []model.AnswerRecord {
+	owner := strings.ToLower(strings.TrimSuffix(domain.Name, "."))
+	pathTTL := int64(86400)
+	seen := make(map[string]bool)
+	for hops := 0; hops < 32; hops++ {
+		if seen[owner] {
+			return nil
+		}
+		seen[owner] = true
+		alias, aliasTTL := "", int64(86400)
+		if domain.Type != "CNAME" {
+			for _, r := range answers {
+				if !strings.EqualFold(strings.TrimSuffix(r.Name, "."), owner) || !strings.EqualFold(r.Type, "CNAME") {
+					continue
+				}
+				next := normalizeAnswer("CNAME", r.Address)
+				if next == "" || (alias != "" && alias != next) {
+					return nil
+				}
+				alias = next
+				if ttl := recordTTL(r.TTL); ttl < aliasTTL {
+					aliasTTL = ttl
+				}
+			}
+		}
+		if alias != "" {
+			if aliasTTL < pathTTL {
+				pathTTL = aliasTTL
+			}
+			owner = alias
+			continue
+		}
+		values := make(map[string]int64)
+		for _, r := range answers {
+			if !strings.EqualFold(strings.TrimSuffix(r.Name, "."), owner) || !strings.EqualFold(r.Type, domain.Type) {
+				continue
+			}
+			value := normalizeAnswer(domain.Type, r.Address)
+			if value == "" {
+				continue
+			}
+			ttl := recordTTL(r.TTL)
+			if pathTTL < ttl {
+				ttl = pathTTL
+			}
+			if old, exists := values[value]; !exists || ttl < old {
+				values[value] = ttl
+			}
+		}
+		records := make([]model.AnswerRecord, 0, len(values))
+		for value, ttl := range values {
+			records = append(records, model.AnswerRecord{Value: value, TTLSeconds: ttl, ObservedAt: now, ExpiresAt: now + ttl*1000})
+		}
+		sort.Slice(records, func(i, j int) bool { return records[i].Value < records[j].Value })
+		return records
+	}
+	return nil
 }

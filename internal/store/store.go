@@ -92,6 +92,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("initialize database: %w", err)
 		}
 	}
+	if err = st.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	initial, _ := json.Marshal(model.DefaultConfig())
 	if _, err = db.Exec("INSERT OR IGNORE INTO config(id,value) VALUES(1,?)", string(initial)); err != nil {
 		db.Close()
@@ -103,7 +107,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) GetConfig() (model.Config, error) {
 	var raw string
-	var c model.Config
+	c := model.DefaultConfig()
 	if err := s.db.QueryRow("SELECT value FROM config WHERE id=1").Scan(&raw); err != nil {
 		return c, err
 	}
@@ -122,10 +126,10 @@ func (s *Store) SaveConfig(c model.Config) error {
 
 type scanner interface{ Scan(...any) error }
 
-const serverColumns = "id,name,provider,address,protocol,enabled,trusted,notes,created_at"
+const serverColumns = "id,name,provider,address,protocol,enabled,trusted,notes,created_at,trust_epoch"
 
 func scanServer(row scanner) (v model.Server, err error) {
-	err = row.Scan(&v.ID, &v.Name, &v.Provider, &v.Address, &v.Protocol, &v.Enabled, &v.Trusted, &v.Notes, &v.CreatedAt)
+	err = row.Scan(&v.ID, &v.Name, &v.Provider, &v.Address, &v.Protocol, &v.Enabled, &v.Trusted, &v.Notes, &v.CreatedAt, &v.TrustEpoch)
 	return
 }
 func (s *Store) ListServers() ([]model.Server, error) {
@@ -187,22 +191,47 @@ func (s *Store) DeleteServer(id int64) error {
 func normalizeSubject(domain, typ string) (string, string) {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), "."), strings.ToUpper(strings.TrimSpace(typ))
 }
+
+// Ordered by severity for SQL MAX aggregation. Do not reuse the legacy 0/1/2 codes.
 func pollutionCode(v string) int {
 	switch v {
-	case "polluted":
-		return 2
-	case "clean":
+	case "matched":
 		return 1
+	case "clean":
+		return 2
+	case "suspicious":
+		return 3
+	case "polluted":
+		return 4
 	default:
 		return 0
 	}
 }
-func effectiveCode(detected int, override string) int {
+func pollutionName(code int) string {
+	switch code {
+	case 1:
+		return "matched"
+	case 2:
+		return "clean"
+	case 3:
+		return "suspicious"
+	case 4:
+		return "polluted"
+	default:
+		return "unknown"
+	}
+}
+func effectiveCode(detected int, policy int, override string) int {
 	if override == "clean" {
-		return 1
+		return 2
 	}
 	if override == "polluted" {
-		return 2
+		return 4
+	}
+	// An old automatic conviction used exact IP equality and cannot establish F
+	// under the TTL/history policy. Keep the original evidence for inspection.
+	if policy < 2 && detected == 4 {
+		return 0
 	}
 	return detected
 }
@@ -266,6 +295,7 @@ func (s *Store) SaveRound(v model.Round) error {
 		r.RoundID = roundID
 		r.ServerID = v.ServerID
 		r.Override = ""
+		r.EffectivePollution = ""
 		if r.Timestamp == 0 {
 			r.Timestamp = v.FinishedAt
 		}
@@ -275,7 +305,7 @@ func (s *Store) SaveRound(v model.Round) error {
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		code := effectiveCode(pollutionCode(r.Pollution), override)
+		code := effectiveCode(pollutionCode(r.Pollution), r.PolicyVersion, override)
 		if code > maxPollution {
 			maxPollution = code
 		}
@@ -283,7 +313,7 @@ func (s *Store) SaveRound(v model.Round) error {
 		if e != nil {
 			return e
 		}
-		if _, err = tx.Exec("INSERT INTO results(round_id,server_id,timestamp,domain,type,detected_pollution,effective_pollution,oldest_reference,raw_json) VALUES(?,?,?,?,?,?,?,?,?)", roundID, v.ServerID, r.Timestamp, r.Domain, r.Type, pollutionCode(r.Pollution), code, oldestReference(r.References), string(raw)); err != nil {
+		if _, err = tx.Exec("INSERT INTO results(round_id,server_id,timestamp,domain,type,detected_pollution,effective_pollution,oldest_reference,raw_json,policy_version) VALUES(?,?,?,?,?,?,?,?,?,?)", roundID, v.ServerID, r.Timestamp, r.Domain, r.Type, pollutionCode(r.Pollution), code, oldestReference(r.References), string(raw), r.PolicyVersion); err != nil {
 			return err
 		}
 	}
@@ -315,6 +345,15 @@ func (s *Store) SaveOverride(v model.Override) error {
 		return err
 	}
 	defer tx.Rollback()
+	if v.Verdict == "polluted" {
+		var trusted bool
+		if err = tx.QueryRow("SELECT trusted FROM servers WHERE id=?", v.ServerID).Scan(&trusted); err != nil {
+			return err
+		}
+		if trusted {
+			return ErrTrustedOverride
+		}
+	}
 	// Keep an audit event even for auto reset; configuration and original evidence are distinct.
 	if _, err = tx.Exec("INSERT INTO override_audit(server_id,domain,type,verdict,note,timestamp) VALUES(?,?,?,?,?,?)", v.ServerID, v.Domain, v.Type, v.Verdict, v.Note, v.UpdatedAt); err != nil {
 		return err
@@ -327,7 +366,7 @@ func (s *Store) SaveOverride(v model.Override) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec("UPDATE results SET effective_pollution=CASE ? WHEN 'clean' THEN 1 WHEN 'polluted' THEN 2 ELSE detected_pollution END WHERE server_id=? AND domain=? AND type=?", v.Verdict, v.ServerID, v.Domain, v.Type)
+	_, err = tx.Exec("UPDATE results SET effective_pollution=CASE ? WHEN 'clean' THEN 2 WHEN 'polluted' THEN 4 ELSE CASE WHEN policy_version<2 AND detected_pollution=4 THEN 0 ELSE detected_pollution END END WHERE server_id=? AND domain=? AND type=?", v.Verdict, v.ServerID, v.Domain, v.Type)
 	if err != nil {
 		return err
 	}
@@ -344,8 +383,10 @@ func (s *Store) SaveOverride(v model.Override) error {
 func decodeResult(row scanner) (model.ProbeResult, error) {
 	var r model.ProbeResult
 	var raw, override string
+	var trusted bool
+	var effective int
 	var id int64
-	if err := row.Scan(&id, &raw, &override); err != nil {
+	if err := row.Scan(&id, &raw, &override, &trusted, &effective); err != nil {
 		return r, err
 	}
 	if err := json.Unmarshal([]byte(raw), &r); err != nil {
@@ -353,6 +394,11 @@ func decodeResult(row scanner) (model.ProbeResult, error) {
 	}
 	r.ID = id
 	r.Override = override
+	r.Trusted = trusted
+	r.EffectivePollution = pollutionName(effective)
+	if trusted {
+		r.EffectivePollution = "matched"
+	}
 	if r.Answers == nil {
 		r.Answers = []string{}
 	}
@@ -362,7 +408,7 @@ func decodeResult(row scanner) (model.ProbeResult, error) {
 	return r, nil
 }
 
-const resultSelect = `SELECT r.id,r.raw_json,COALESCE(o.verdict,'') FROM results r LEFT JOIN overrides o ON o.server_id=r.server_id AND o.domain=r.domain AND o.type=r.type `
+const resultSelect = `SELECT r.id,r.raw_json,COALESCE(o.verdict,''),s.trusted,r.effective_pollution FROM results r JOIN servers s ON s.id=r.server_id LEFT JOIN overrides o ON o.server_id=r.server_id AND o.domain=r.domain AND o.type=r.type `
 
 func (s *Store) Results(serverID int64, limit int, before int64) ([]model.ProbeResult, error) {
 	return s.ResultsPage(serverID, limit, before, 0)
@@ -448,6 +494,9 @@ func (s *Store) WalkResults(serverID, since int64, fn func(model.ProbeResult) er
 // Cleanup deletes bounded batches in short transactions, including raw reference evidence.
 // Active manual overrides are configuration; their audit history follows the same retention.
 func (s *Store) Cleanup(before int64) error {
+	if _, err := s.db.Exec("DELETE FROM trusted_observations WHERE observed_at<?", before); err != nil {
+		return err
+	}
 	// Cached reference evidence can predate a retained target. Prune it by indexed timestamp.
 	for {
 		tx, err := s.db.Begin()
@@ -488,6 +537,20 @@ func (s *Store) Cleanup(before int64) error {
 		for _, v := range batch {
 			kept := make([]model.Reference, 0, len(v.result.References))
 			for _, ref := range v.result.References {
+				if len(ref.Records) > 0 {
+					records := make([]model.AnswerRecord, 0, len(ref.Records))
+					answers := make([]string, 0, len(ref.Records))
+					for _, record := range ref.Records {
+						if record.ObservedAt >= before {
+							records = append(records, record)
+							answers = append(answers, record.Value)
+						}
+					}
+					ref.Records, ref.Answers = records, answers
+					if len(records) == 0 {
+						continue
+					}
+				}
 				if ref.Timestamp >= before {
 					kept = append(kept, ref)
 				}
@@ -629,13 +692,7 @@ func (a *accumulator) finish(window int64) model.Metrics {
 			}
 		}
 	}
-	m.Pollution = "unknown"
-	if a.pollution == 1 {
-		m.Pollution = "clean"
-	}
-	if a.pollution == 2 {
-		m.Pollution = "polluted"
-	}
+	m.Pollution = pollutionName(a.pollution)
 	// 50 ms earns the full latency component; 2 s or more earns zero.
 	latencyScore := math.Max(0, math.Min(100, 100*(2000-m.P95MS)/1950))
 	if a.latencyCount == 0 {
@@ -643,9 +700,11 @@ func (a *accumulator) finish(window int64) model.Metrics {
 	}
 	m.Score = .45*m.Availability + .35*m.SuccessRate + .20*latencyScore
 	switch {
-	case a.pollution == 2:
+	case a.pollution == 4:
 		m.Grade = "F"
 		m.Score = 0
+	case a.pollution == 3:
+		m.Grade = "E"
 	case m.Samples < 10 || a.covered < 30*60*1000:
 		m.Grade = "pending"
 	case m.Score >= 95:
@@ -727,7 +786,7 @@ func (s *Store) Summary(since, now int64) ([]model.ServerSummary, error) {
 		return nil, err
 	}
 	for _, v := range servers {
-		value := model.ServerSummary{Server: v, Metrics: acc[v.ID].finish(now - since)}
+		value := model.ServerSummary{Server: v, Metrics: acc[v.ID].finishForServer(now-since, v.Trusted)}
 		err = s.db.QueryRow("SELECT finished_at,next_due,successes>0 FROM rounds WHERE server_id=? AND auxiliary=0 ORDER BY finished_at DESC,id DESC LIMIT 1", v.ID).Scan(&value.LastProbe, &value.NextDue, &value.LastSuccess)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -753,7 +812,8 @@ func (s *Store) History(serverID, since, now, stepMS int64) ([]model.HistoryPoin
 	if now <= since {
 		return nil, model.Metrics{}, errors.New("invalid time range")
 	}
-	if _, err := s.GetServer(serverID); err != nil {
+	server, err := s.GetServer(serverID)
+	if err != nil {
 		return nil, model.Metrics{}, err
 	}
 	if stepMS < 1 {
@@ -849,9 +909,9 @@ func (s *Store) History(serverID, since, now, stepMS int64) ([]model.HistoryPoin
 	values := make([]model.HistoryPoint, count)
 	for i := range points {
 		at := since + int64(i)*stepMS
-		values[i] = model.HistoryPoint{Timestamp: at, Metrics: points[i].finish(min(stepMS, now-at))}
+		values[i] = model.HistoryPoint{Timestamp: at, Metrics: points[i].finishForServer(min(stepMS, now-at), server.Trusted)}
 	}
-	return values, total.finish(now - since), nil
+	return values, total.finishForServer(now-since, server.Trusted), nil
 }
 
 func oldestReference(refs []model.Reference) int64 {
@@ -859,6 +919,11 @@ func oldestReference(refs []model.Reference) int64 {
 	for _, ref := range refs {
 		if ref.Timestamp > 0 && (at == 0 || ref.Timestamp < at) {
 			at = ref.Timestamp
+		}
+		for _, record := range ref.Records {
+			if record.ObservedAt > 0 && (at == 0 || record.ObservedAt < at) {
+				at = record.ObservedAt
+			}
 		}
 	}
 	return at

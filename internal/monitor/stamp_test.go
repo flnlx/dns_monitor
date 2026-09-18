@@ -37,3 +37,19 @@ func TestStampProtocolLayouts(t *testing.T) {
 		}
 	}
 }
+
+func TestAddressKeySupportsEmptyStampHashContinuations(t *testing.T) {
+	b := make([]byte, 9)
+	b[0] = 2
+	b = append(b, 0, 128, 0)
+	host, path := []byte("DNS.EXAMPLE.COM:443"), []byte("/dns-query")
+	b = append(b, byte(len(host)))
+	b = append(b, host...)
+	b = append(b, byte(len(path)))
+	b = append(b, path...)
+	stamp := "sdns://" + base64.RawURLEncoding.EncodeToString(b)
+	got, err := AddressKey(stamp)
+	if err != nil || got != "https://dns.example.com/dns-query" {
+		t.Fatalf("got=%s err=%v", got, err)
+	}
+}

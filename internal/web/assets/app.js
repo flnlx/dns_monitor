@@ -3,7 +3,7 @@
 (() => {
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'average_ms', descending: false, detailID: null, history: [], results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false };
+  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'average_ms', descending: false, detailID: null, history: [], results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null };
   const ranges = { '24h': 24 * 3600000, '7d': 7 * 86400000, '30d': 30 * 86400000 };
   const titles = { overview: ['监测总览', 'NETWORK OBSERVABILITY'], config: ['探测配置', 'MONITORING PREFERENCES'], service: ['Windows 服务', 'ALWAYS-ON MONITORING'], guide: ['使用指南', 'YOUR OBSERVATION HANDBOOK'] };
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -11,13 +11,18 @@
   const integer = value => number(value, 0);
   const timestamp = (value, full = false) => value ? new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', ...(full ? { second: '2-digit' } : {}), hour12: false }) : '尚未探测';
   const hasSamples = metrics => (metrics?.samples || 0) > 0;
+  const hasCoverage = metrics => (metrics?.coverage || 0) > 0;
   const hasLatency = metrics => hasSamples(metrics) && (metrics.success_rate > 0 || metrics.average_ms > 0 || metrics.p95_ms > 0);
-  const percent = (value, metrics) => hasSamples(metrics) ? `${number(value)}%` : '—';
+  const percent = (value, metrics, availability = false) => (availability ? hasCoverage(metrics) : hasSamples(metrics)) ? `${number(value)}%` : '—';
   const currentServer = () => state.data?.servers.find(server => server.id === state.detailID);
-  const pollutionKind = value => value === 'polluted' ? 'polluted' : value === 'clean' ? 'clean' : 'unknown';
-  const pollutionLabel = value => ({ polluted: '存在污染', clean: '未发现污染', unknown: '尚未确定' })[pollutionKind(value)];
-  const badge = value => `<span class="pollution-badge ${pollutionKind(value)}"><span aria-hidden="true">${pollutionKind(value) === 'polluted' ? '!' : pollutionKind(value) === 'clean' ? '✓' : '·'}</span>${pollutionLabel(value)}</span>`;
-  const gradeHTML = value => ['A', 'B', 'C', 'D', 'F'].includes(value) ? `<span class="grade grade-${value.toLowerCase()}" title="${({ A: '优秀', B: '良好', C: '一般', D: '较差', F: '污染' })[value]}">${value}</span>` : '<span class="grade grade-pending">待评估</span>';
+  const trustedResult = result => !!result.trusted || !!state.data?.servers.find(server => server.id === result.server_id)?.trusted;
+  const serverPollution = server => server.trusted ? 'clean' : server.metrics?.pollution;
+  const displayedGrade = (metrics, trusted = false) => trusted && ['E', 'F'].includes(metrics?.grade) ? 'pending' : metrics?.grade;
+  const trustedBadge = '<span class="pollution-badge trusted">✓ 用户可信 / 无污染</span>';
+  const pollutionKind = value => ['matched', 'clean', 'suspicious', 'polluted'].includes(value) ? value : 'unknown';
+  const pollutionLabel = value => ({ matched: '参考一致', clean: '正常', suspicious: '可疑', polluted: '疑似污染', unknown: '待判定' })[pollutionKind(value)];
+  const badge = (value, confirmed = false) => `<span class="pollution-badge ${pollutionKind(value)}"><span aria-hidden="true">${['polluted', 'suspicious'].includes(pollutionKind(value)) ? '!' : ['matched', 'clean'].includes(pollutionKind(value)) ? '✓' : '·'}</span>${confirmed && value === 'polluted' ? '已确认污染' : pollutionLabel(value)}</span>`;
+  const gradeHTML = value => ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? `<span class="grade grade-${value.toLowerCase()}" title="${({ A: '优秀', B: '良好', C: '一般', D: '较差', E: '可疑', F: '疑似或人工确认污染' })[value]}">${value}</span>` : '<span class="grade grade-pending">待评估</span>';
 
   function setError(selector, message) {
     const element = $(selector);
@@ -40,6 +45,10 @@
   function resetSession(message = '') {
     state.token = '';
     clearTimeout(state.refreshTimer);
+    clearTimeout(state.manualTimer);
+    clearTimeout(state.detailProbeTimer);
+    state.manualRefresh = null;
+    state.detailProbe = null;
     closeDialogs();
     $('#app').hidden = true;
     $('#login-screen').hidden = false;
@@ -60,7 +69,9 @@
     try { body = await response.json(); } catch { body = null; }
     if (!response.ok) {
       if (response.status === 401) resetSession('会话已失效，请重新输入访问密钥。');
-      throw new Error(body?.error || `请求未完成（HTTP ${response.status}）`);
+      const error = new Error(body?.error || `请求未完成（HTTP ${response.status}）`);
+      error.status = response.status;
+      throw error;
     }
     return body;
   }
@@ -110,12 +121,14 @@
   }
 
   async function refreshState(initial = false) {
-    if (!state.token || state.refreshing) return;
+    if (!state.token || state.refreshing) return null;
     state.refreshing = true;
-    const button = $('#refresh-button');
-    button.disabled = true;
+    renderRefreshButton();
     try {
-      const response = await api(`/state?range=${encodeURIComponent(state.range)}`);
+      const requestedRange = state.range;
+      const response = await api(`/state?range=${encodeURIComponent(requestedRange)}`);
+      state.loadedRange = requestedRange;
+      const previous = currentServer()?.last_probe || 0;
       state.data = response;
       state.data.servers ||= [];
       renderOverview();
@@ -125,12 +138,89 @@
       $('#restart-notice').hidden = !response.listen_restart_required;
       $('#last-refresh').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
       setError('#global-error', response.runtime?.last_error ? `最近运行提示：${response.runtime.last_error}` : '');
+      if ($('#detail-dialog').open) {
+        renderDetailHeader();
+        if ((currentServer()?.last_probe || 0) > previous) await Promise.allSettled([loadHistory(), loadResults(true)]);
+      }
+      return response;
     } catch (error) {
       if (state.token) setError('#global-error', `无法更新数据：${error.message === 'Failed to fetch' ? '连接中断，请检查程序或 Windows 服务是否运行。' : error.message}`);
+      return null;
     } finally {
       state.refreshing = false;
-      button.disabled = false;
+      renderRefreshButton();
     }
+  }
+
+  function renderRefreshButton() {
+    const button = $('#refresh-button');
+    const batch = state.manualRefresh;
+    $('#export-button').disabled = !state.data || state.loadedRange !== state.range || state.refreshing;
+    const paused = !!state.data?.runtime?.paused || state.data?.config?.concurrency === 0;
+    button.disabled = !!batch || paused;
+    button.innerHTML = batch ? '<span class="spinner" aria-hidden="true"></span> 探测 ' + integer(batch.completed || 0) + '/' + integer(batch.total || 0) : '<span aria-hidden="true">↻</span> 刷新';
+    button.title = paused ? '并发数为 0，探测已暂停；调整配置后可手动刷新' : batch ? '等待本轮实际探测完成' : '立即探测所有已启用 DNS，并读取新结果';
+  }
+
+  function showProbeProgress(batch, done = false) {
+    const element = $('#probe-progress');
+    element.hidden = false;
+    element.className = 'notice ' + (batch.error ? 'warning' : 'info') + ' probe-progress';
+    element.textContent = batch.error ? '本轮刷新：' + batch.error : done ? '刷新完成：' + integer(batch.completed || 0) + ' 台 DNS 已完成新的探测。' : '正在重新探测 DNS：' + integer(batch.completed || 0) + ' / ' + integer(batch.total || 0) + ' 已完成，' + integer(Math.max(0, Number(batch.total || 0) - Number(batch.completed || 0))) + ' 台等待完成。';
+  }
+
+  async function manualRefresh() {
+    if (state.manualRefresh) return;
+    if (state.data?.runtime?.paused || state.data?.config?.concurrency === 0) return toast('探测已暂停，请将并发数设为大于 0 后重试', true);
+    state.manualRefresh = { id: null, total: 0, completed: 0, pending: 0, starting: true, failures: 0 };
+    renderRefreshButton();
+    try {
+      const batch = await api('/probes', { method: 'POST', body: {} });
+      state.manualRefresh = { ...batch, failures: 0 };
+      showProbeProgress(batch);
+      await pollManualRefresh();
+    } catch (error) {
+      state.manualRefresh = null;
+      $('#probe-progress').hidden = true;
+      toast(error.message, true);
+      renderRefreshButton();
+    }
+  }
+
+  async function pollManualRefresh() {
+    clearTimeout(state.manualTimer);
+    const tracking = state.manualRefresh;
+    if (!tracking || !state.token) return;
+    const response = await refreshState();
+    if (!state.token || state.manualRefresh !== tracking) return;
+    const reported = response?.runtime?.refresh;
+    if (reported && String(reported.id) === String(tracking.id)) {
+      Object.assign(tracking, reported, { failures: 0 });
+    } else if (response && reported?.id && String(reported.id) !== String(tracking.id)) {
+      state.manualRefresh = null;
+      toast('服务器上的刷新批次已变化，当前列表已更新；可再次点击刷新。', true);
+      renderRefreshButton();
+      return;
+    } else if (!response && !state.refreshing) {
+      tracking.failures = (tracking.failures || 0) + 1;
+      if (tracking.failures >= 5) {
+        state.manualRefresh = null;
+        showProbeProgress({ error: '暂时无法读取探测进度，后台任务可能仍在运行。恢复连接后再刷新状态。' });
+        renderRefreshButton();
+        return;
+      }
+    }
+    const done = tracking.pending === false || Number(tracking.completed || 0) >= Number(tracking.total || 0);
+    showProbeProgress(tracking, done);
+    renderRefreshButton();
+    if (done) {
+      state.manualRefresh = null;
+      if ($('#detail-dialog').open) await Promise.allSettled([loadHistory(), loadResults(true)]);
+      renderRefreshButton();
+      toast(tracking.error || (tracking.total ? '所有已启用 DNS 的新一轮探测已完成' : '没有需要探测的已启用 DNS'), !!tracking.error);
+      return;
+    }
+    state.manualTimer = setTimeout(pollManualRefresh, 1000);
   }
 
   function renderRuntime() {
@@ -148,7 +238,8 @@
     const servers = state.data.servers;
     const enabled = servers.filter(server => server.enabled);
     const online = enabled.filter(server => server.last_probe && server.last_success);
-    const polluted = servers.filter(server => pollutionKind(server.metrics?.pollution) === 'polluted');
+    const polluted = servers.filter(server => pollutionKind(serverPollution(server)) === 'polluted');
+    const suspicious = servers.filter(server => pollutionKind(serverPollution(server)) === 'suspicious');
     const sampled = servers.filter(server => hasSamples(server.metrics));
     const responding = sampled.filter(server => hasLatency(server.metrics));
     const average = responding.length ? responding.reduce((sum, server) => sum + server.metrics.average_ms, 0) / responding.length : null;
@@ -156,7 +247,7 @@
     const cards = [
       { title: '监测服务器', value: integer(servers.length), unit: '台', caption: `${enabled.length} 台已启用 · ${servers.filter(server => server.trusted).length} 台可信 DNS`, icon: '◫', kind: '' },
       { title: '最近查询正常', value: integer(online.length), unit: '台', caption: `${enabled.filter(server => server.last_probe && !server.last_success).length} 台异常 · ${enabled.filter(server => !server.last_probe).length} 台待首次探测`, icon: '↗', kind: 'good' },
-      { title: '存在解析污染', value: integer(polluted.length), unit: '台', caption: `所选区间 · ${servers.filter(server => pollutionKind(server.metrics?.pollution) === 'unknown').length} 台尚未确定`, icon: '!', kind: polluted.length ? 'bad' : '' },
+      { title: '解析异常', value: integer(polluted.length + suspicious.length), unit: '台', caption: `${polluted.length} 台 F · ${suspicious.length} 台 E · ${servers.filter(server => pollutionKind(serverPollution(server)) === 'unknown').length} 台待判定`, icon: '!', kind: polluted.length ? 'bad' : suspicious.length ? 'warning' : '' },
       { title: '服务器平均时延', value: average === null ? '—' : number(average, 0), unit: 'ms', caption: `${responding.length} 台响应服务器均值 · ${integer(samples)} 次采样`, icon: '⌁', kind: '' }
     ];
     $('#summary-cards').innerHTML = cards.map(card => `<article class="summary-card ${card.kind}"><div class="summary-top"><span>${escape(card.title)}</span><span class="summary-icon" aria-hidden="true">${escape(card.icon)}</span></div><div class="summary-value">${card.value}<small>${card.unit}</small></div><p class="summary-caption">${escape(card.caption)}</p></article>`).join('');
@@ -180,37 +271,51 @@
     return '等待下一次探测';
   }
 
-  function rateCell(value, metrics) {
-    if (!hasSamples(metrics)) return '<span class="muted">—</span>';
+  function rateCell(value, metrics, availability = false) {
+    if (!(availability ? hasCoverage(metrics) : hasSamples(metrics))) return '<span class="muted">—</span>';
     const rate = Math.max(0, Math.min(100, Number(value) || 0));
     return `<div class="rate-cell"><span>${number(rate)}%</span><span class="mini-track" aria-hidden="true"><span class="${rate < 90 ? 'bad' : rate < 99 ? 'warning' : ''}" style="width:${rate}%"></span></span></div>`;
   }
 
-  function renderServerRows() {
-    if (!state.data) return;
+  function visibleServers() {
+    if (!state.data) return [];
     const search = $('#search-filter').value.trim().toLowerCase();
     const protocol = $('#protocol-filter').value;
     const pollution = $('#pollution-filter').value;
     const grade = $('#grade-filter').value;
     const servers = state.data.servers.filter(server => {
       const metrics = server.metrics || {};
-      const gradeValue = ['A', 'B', 'C', 'D', 'F'].includes(metrics.grade) ? metrics.grade : 'pending';
-      return (!search || [server.name, server.provider, server.address].some(value => String(value || '').toLowerCase().includes(search))) && (!protocol || server.protocol === protocol) && (!pollution || pollutionKind(metrics.pollution) === pollution) && (!grade || gradeValue === grade);
+      const value = displayedGrade(metrics, server.trusted);
+      const gradeValue = ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? value : 'pending';
+      return (!search || [server.name, server.provider, server.address].some(value => String(value || '').toLowerCase().includes(search))) && (!protocol || server.protocol === protocol) && (!pollution || pollutionKind(serverPollution(server)) === pollution) && (!grade || gradeValue === grade);
     });
     servers.sort((left, right) => {
       const lm = left.metrics || {};
       const rm = right.metrics || {};
-      const comparable = state.sort === 'average_ms' ? hasLatency : hasSamples;
+      if (state.sort === 'grade') {
+        const grades = ['A', 'B', 'C', 'D', 'E', 'F'];
+        const leftRank = grades.indexOf(displayedGrade(lm, left.trusted));
+        const rightRank = grades.indexOf(displayedGrade(rm, right.trusted));
+        if (leftRank < 0 || rightRank < 0) return leftRank < 0 && rightRank < 0 ? left.id - right.id : leftRank < 0 ? 1 : -1;
+        return (state.descending ? rightRank - leftRank : leftRank - rightRank) || left.id - right.id;
+      }
+      const comparable = state.sort === 'average_ms' ? hasLatency : state.sort === 'availability' ? hasCoverage : hasSamples;
       if (!comparable(lm) || !comparable(rm)) return comparable(lm) ? -1 : comparable(rm) ? 1 : left.id - right.id;
       const difference = (lm[state.sort] || 0) - (rm[state.sort] || 0);
       return (state.descending ? -difference : difference) || left.id - right.id;
     });
+    return servers;
+  }
+
+  function renderServerRows() {
+    if (!state.data) return;
+    const servers = visibleServers();
     $('#server-rows').innerHTML = servers.map(server => {
       const metrics = server.metrics || {};
       const known = !!server.last_probe;
       const statusClass = !server.enabled || !known ? 'unknown' : server.last_success ? '' : 'offline';
       const status = !server.enabled ? '已停用' : !known ? '待探测' : server.last_success ? '查询正常' : '查询异常';
-      return `<tr data-server-id="${server.id}"><td><button class="server-name-button" data-action="detail" data-id="${server.id}" title="查看 ${escape(server.name)} 的历史记录"><span class="server-avatar" aria-hidden="true">${escape((server.provider || server.name || 'D').slice(0, 1).toUpperCase())}</span><span><span class="server-name"><span class="name-text">${escape(server.name)}</span>${server.trusted ? '<span class="trusted-mark">可信</span>' : ''}</span><span class="server-secondary" title="${escape(server.address)}">${escape(server.provider || server.address)}</span></span></button></td><td title="最后探测：${escape(timestamp(server.last_probe, true))}"><span class="status-label ${statusClass}"><span class="status-dot"></span>${status}</span><div class="sub-status">${escape(relativeProbe(server))}</div></td><td><span class="protocol-badge">${escape((server.protocol || '—').toUpperCase())}</span></td><td><span class="latency-value">${hasLatency(metrics) ? number(metrics.average_ms, 0) : '—'}<small>ms</small></span></td><td>${rateCell(metrics.availability, metrics)}</td><td>${rateCell(metrics.success_rate, metrics)}</td><td>${badge(metrics.pollution)}</td><td>${gradeHTML(metrics.grade)}</td><td class="actions-cell"><div class="row-actions"><button class="row-action" data-action="edit" data-id="${server.id}" aria-label="编辑 ${escape(server.name)}">编辑</button><button class="row-action delete" data-action="delete" data-id="${server.id}" aria-label="删除 ${escape(server.name)}">删除</button></div></td></tr>`;
+      return `<tr data-server-id="${server.id}"><td><button class="server-name-button" data-action="detail" data-id="${server.id}" title="查看 ${escape(server.name)} 的历史记录"><span class="server-avatar" aria-hidden="true">${escape((server.provider || server.name || 'D').slice(0, 1).toUpperCase())}</span><span><span class="server-name"><span class="name-text">${escape(server.name)}</span>${server.trusted ? '<span class="trusted-mark">可信</span>' : ''}</span><span class="server-secondary" title="${escape(server.address)}">${escape(server.provider || server.address)}</span></span></button></td><td title="最后探测：${escape(timestamp(server.last_probe, true))}"><span class="status-label ${statusClass}"><span class="status-dot"></span>${status}</span><div class="sub-status">${escape(relativeProbe(server))}</div></td><td><span class="protocol-badge">${escape((server.protocol || '—').toUpperCase())}</span></td><td><span class="latency-value">${hasLatency(metrics) ? number(metrics.average_ms, 0) : '—'}<small>ms</small></span></td><td>${rateCell(metrics.availability, metrics, true)}</td><td>${rateCell(metrics.success_rate, metrics)}</td><td>${server.trusted ? trustedBadge : badge(metrics.pollution)}</td><td>${gradeHTML(displayedGrade(metrics, server.trusted))}</td><td class="actions-cell"><div class="row-actions"><button class="row-action" data-action="edit" data-id="${server.id}" aria-label="编辑 ${escape(server.name)}">编辑</button><button class="row-action delete" data-action="delete" data-id="${server.id}" aria-label="删除 ${escape(server.name)}">删除</button></div></td></tr>`;
     }).join('');
     $('#servers-empty').hidden = servers.length > 0;
     if (!servers.length) {
@@ -289,7 +394,7 @@
       $('#server-dialog').close();
       toast(id ? '服务器配置已更新' : 'DNS 服务器已添加');
       await refreshState();
-      if (state.detailID === id && $('#detail-dialog').open) renderDetailHeader();
+      if (state.detailID === id && $('#detail-dialog').open) { renderDetailHeader(); renderResults(); await loadHistory(); }
     } catch (error) { setError('#server-error', error.message); }
     finally { button.disabled = false; }
   }
@@ -309,7 +414,7 @@
     const row = document.createElement('div');
     row.className = 'domain-row';
     const types = ['A', 'CNAME', 'TXT', 'NS', 'MX', 'SOA', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'PTR'];
-    row.innerHTML = `<input type="text" class="domain-name" aria-label="探测域名" placeholder="example.com" spellcheck="false" maxlength="253" required value="${escape(domain.name)}"><select class="domain-type-select" aria-label="记录类型">${types.map(type => `<option value="${type}"${type === domain.type ? ' selected' : ''}>${type}</option>`).join('')}</select><button class="icon-button remove-domain" type="button" aria-label="删除这个探测域名">×</button>`;
+    row.innerHTML = `<input type="text" class="domain-name" aria-label="探测域名" placeholder="www.youtube.com" spellcheck="false" maxlength="253" required value="${escape(domain.name)}"><select class="domain-type-select" aria-label="记录类型">${types.map(type => `<option value="${type}"${type === domain.type ? ' selected' : ''}>${type}</option>`).join('')}</select><button class="icon-button remove-domain" type="button" aria-label="删除这个探测域名">×</button>`;
     return row;
   }
 
@@ -317,7 +422,7 @@
     if (!state.data?.config) return;
     const form = $('#config-form');
     const config = state.data.config;
-    ['listen', 'interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds'].forEach(field => { form.elements[field].value = config[field] ?? ''; });
+    ['listen', 'interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours'].forEach(field => { form.elements[field].value = config[field] ?? ''; });
     form.elements.smart_backoff.checked = config.smart_backoff;
     $('#domain-rows').replaceChildren(...(config.domains || []).map(domainRow));
     if (!config.domains?.length) $('#domain-rows').append(domainRow());
@@ -337,7 +442,7 @@
     event.preventDefault();
     const form = event.currentTarget;
     const body = { listen: form.elements.listen.value.trim(), smart_backoff: form.elements.smart_backoff.checked, domains: $$('.domain-row').map(row => ({ name: $('.domain-name', row).value.trim(), type: $('.domain-type-select', row).value })) };
-    ['interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds'].forEach(field => { body[field] = Number(form.elements[field].value); });
+    ['interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours'].forEach(field => { body[field] = Number(form.elements[field].value); });
     const button = $('#save-config-button');
     button.disabled = true;
     setError('#config-error', '');
@@ -377,7 +482,8 @@
     $('#detail-title').textContent = server.name;
     $('#detail-address').textContent = server.address;
     $('#detail-tags').innerHTML = `<span class="protocol-badge">${escape((server.protocol || '—').toUpperCase())}</span>${server.provider ? `<span class="tag">${escape(server.provider)}</span>` : ''}${server.trusted ? '<span class="tag">用户可信 DNS</span>' : ''}<span class="tag">${server.enabled ? '已启用' : '已停用'}</span><span class="tag">最近 ${escape(timestamp(server.last_probe))}</span>`;
-    $('#detail-probe').disabled = !server.enabled || !!state.data.runtime?.paused || state.data.config?.concurrency === 0;
+    $('#detail-probe').disabled = !server.enabled || !!state.data.runtime?.paused || state.data.config?.concurrency === 0 || state.detailProbe?.id === server.id;
+    $('#detail-probe').textContent = state.detailProbe?.id === server.id ? '等待探测结果…' : '立即探测';
     $$('[data-detail-range]').forEach(button => {
       const active = button.dataset.detailRange === state.detailRange;
       button.classList.toggle('active', active);
@@ -395,8 +501,8 @@
       if (request !== state.detailRequest || id !== state.detailID || range !== state.detailRange) return;
       state.history = (response.points || []).slice().sort((left, right) => left.timestamp - right.timestamp);
       const metrics = response.metrics || {};
-      $('#detail-metrics').innerHTML = `<div class="detail-metric"><span>可用率</span><strong>${percent(metrics.availability, metrics)}</strong></div><div class="detail-metric"><span>查询成功率</span><strong>${percent(metrics.success_rate, metrics)}</strong></div><div class="detail-metric"><span>P95 时延</span><strong>${hasLatency(metrics) ? number(metrics.p95_ms, 0) : '—'}<small>ms</small></strong></div><div class="detail-metric"><span>原始采样</span><strong>${integer(metrics.samples || 0)}<small>次</small></strong></div><div class="detail-metric"><span>时间覆盖率</span><strong>${hasSamples(metrics) ? number(metrics.coverage) + '%' : '—'}</strong></div><div class="detail-metric"><span>质量评级</span>${gradeHTML(metrics.grade)}</div>`;
-      $('#chart-note').textContent = `图表按时间聚合，空白表示未采样；当前区间 ${integer(metrics.samples || 0)} 次采样，${pollutionLabel(metrics.pollution)}。`;
+      $('#detail-metrics').innerHTML = `<div class="detail-metric"><span>可用率</span><strong>${percent(metrics.availability, metrics, true)}</strong></div><div class="detail-metric"><span>查询成功率</span><strong>${percent(metrics.success_rate, metrics)}</strong></div><div class="detail-metric"><span>P95 时延</span><strong>${hasLatency(metrics) ? number(metrics.p95_ms, 0) : '—'}<small>ms</small></strong></div><div class="detail-metric"><span>原始采样</span><strong>${integer(metrics.samples || 0)}<small>次</small></strong></div><div class="detail-metric"><span>时间覆盖率</span><strong>${hasSamples(metrics) ? number(metrics.coverage) + '%' : '—'}</strong></div><div class="detail-metric"><span>质量评级</span>${gradeHTML(displayedGrade(metrics, currentServer()?.trusted))}</div>`;
+      $('#chart-note').textContent = `图表按时间聚合，空白表示未采样；当前区间 ${integer(metrics.samples || 0)} 次采样，${currentServer()?.trusted ? '用户可信 / 无污染' : pollutionLabel(metrics.pollution)}。`;
       renderCharts();
     } catch (error) { if (request === state.detailRequest) setError('#detail-error', `历史读取失败：${error.message}`); }
   }
@@ -428,37 +534,89 @@
   }
 
   function effectivePollution(result) {
-    return result.override === 'clean' || result.override === 'polluted' ? result.override : result.pollution;
+    if (trustedResult(result)) return 'clean';
+    if (result.override === 'clean' || result.override === 'polluted') return result.override;
+    return result.effective_pollution ?? result.pollution;
   }
 
   function renderResults() {
-    $('#result-rows').innerHTML = state.results.length ? state.results.map((result, index) => `<tr><td>${escape(timestamp(result.timestamp, true))}</td><td><button class="domain-button ${pollutionKind(effectivePollution(result))}" data-result-index="${index}" title="查看解析证据与人工判定">${effectivePollution(result) === 'polluted' ? '<span aria-label="污染标记">⚑</span>' : ''}${escape(result.domain)}<span aria-hidden="true">⌄</span></button><span class="domain-type">${escape(result.type)}</span></td><td title="${escape(result.error || '')}"><span class="result-code${result.success ? '' : ' failed'}">${escape(result.rcode || (result.received ? '响应异常' : '无响应'))}</span></td><td>${result.received ? number(result.latency_ms, 0) + ' ms' : '—'}</td><td>${badge(effectivePollution(result))}${result.override && result.override !== 'auto' ? '<small class="muted" style="margin-left:5px;font-size:8px">人工</small>' : ''}</td></tr>`).join('') : '<tr><td colspan="5" class="muted" style="text-align:center;padding:35px">尚无探测记录。启用服务器并等待下一轮采样，或点击“立即探测”。</td></tr>';
+    $('#result-rows').innerHTML = state.results.length ? state.results.map((result, index) => `<tr><td>${escape(timestamp(result.timestamp, true))}</td><td><button class="domain-button ${pollutionKind(effectivePollution(result))}" data-result-index="${index}" title="查看解析证据与人工判定">${['polluted', 'suspicious'].includes(effectivePollution(result)) ? '<span aria-label="解析异常标记">⚑</span>' : ''}${escape(result.domain)}<span aria-hidden="true">⌄</span></button><span class="domain-type">${escape(result.type)}</span></td><td title="${escape(result.error || '')}"><span class="result-code${result.success ? '' : ' failed'}">${escape(result.rcode || (result.received ? '响应异常' : '无响应'))}</span></td><td>${result.received ? number(result.latency_ms, 0) + ' ms' : '—'}</td><td>${trustedResult(result) ? trustedBadge : badge(effectivePollution(result), result.override === 'polluted')}${!trustedResult(result) && result.override && result.override !== 'auto' ? '<small class="muted" style="margin-left:5px;font-size:13px">人工</small>' : ''}</td></tr>`).join('') : '<tr><td colspan="5" class="muted" style="text-align:center;padding:35px">尚无探测记录。启用服务器并等待下一轮采样，或点击“立即探测”。</td></tr>';
     $('#results-count').textContent = `已显示 ${integer(state.results.length)} 条记录 · 从新到旧`;
     $('#results-more').hidden = state.resultEnd || !state.results.length;
   }
 
   async function probeNow() {
-    const button = $('#detail-probe');
-    button.disabled = true;
+    const server = currentServer();
+    if (!server || state.detailProbe?.id === server.id) return;
+    state.detailProbe = { id: server.id, baseline: server.last_probe || 0, failures: 0 };
+    renderDetailHeader();
     try {
-      await api(`/servers/${state.detailID}/probe`, { method: 'POST', body: {} });
-      toast('已加入探测队列，结果会在采样完成后写入');
-      setTimeout(async () => {
-        if (!state.token || !$('#detail-dialog').open) return;
-        await Promise.allSettled([refreshState(), loadHistory(), loadResults(true)]);
-      }, Math.max(3000, Math.min(15000, (state.data.config?.timeout_seconds || 3) * 1500)));
-    } catch (error) { toast(error.message, true); }
-    finally { button.disabled = false; renderDetailHeader(); }
+      await api(`/servers/${server.id}/probe`, { method: 'POST', body: {} });
+      toast('已加入探测队列，正在等待新的真实结果');
+      pollDetailProbe();
+    } catch (error) {
+      state.detailProbe = null;
+      toast(error.message, true);
+      renderDetailHeader();
+    }
+  }
+
+  async function pollDetailProbe() {
+    clearTimeout(state.detailProbeTimer);
+    const tracking = state.detailProbe;
+    if (!tracking || !state.token) return;
+    if (!$('#detail-dialog').open || tracking.id !== state.detailID) {
+      state.detailProbe = null;
+      return;
+    }
+    const response = await refreshState();
+    if (state.detailProbe !== tracking) return;
+    const server = state.data?.servers.find(item => item.id === tracking.id);
+    if (server && server.last_probe > tracking.baseline) {
+      state.detailProbe = null;
+      await Promise.allSettled([loadHistory(), loadResults(true)]);
+      renderDetailHeader();
+      toast('新的探测结果已写入并显示');
+      return;
+    }
+    if (!server || !server.enabled || response?.runtime?.paused || response?.config?.concurrency === 0) {
+      state.detailProbe = null;
+      renderDetailHeader();
+      setError('#detail-error', '探测已暂停或服务器已停用，请检查配置后重试。');
+      return;
+    }
+    if (!response && !state.refreshing) tracking.failures++; else if (response) tracking.failures = 0;
+    if (tracking.failures >= 5) {
+      state.detailProbe = null;
+      renderDetailHeader();
+      setError('#detail-error', '无法读取新探测进度。后台任务可能仍在运行，请恢复连接后更新记录。');
+      return;
+    }
+    state.detailProbeTimer = setTimeout(pollDetailProbe, 1000);
+  }
+
+  function answerEvidence(answer, queryTime, reference = false) {
+    if (!answer.records?.length) return answer.answers?.join('\n') || answer.error || '没有返回答案';
+    return answer.records.map(record => {
+      const ttl = Number(record.ttl_seconds);
+      const ttlText = Number.isFinite(ttl) && ttl >= 0 ? ` · TTL ${integer(ttl)} 秒` : '';
+      const freshness = reference && record.expires_at && queryTime ? record.expires_at > queryTime ? ' · 当时新鲜' : ' · 近期历史' : '';
+      return `${record.value}${ttlText}${freshness}`;
+    }).join('\n');
   }
 
   function showVerdict(index) {
     const result = state.results[index];
     if (!result) return;
     state.result = result;
+    $('[data-verdict="polluted"]').hidden = trustedResult(result);
+    $('[data-verdict="polluted"]').disabled = trustedResult(result);
     $('#verdict-domain').textContent = result.domain;
     $('#verdict-subtitle').textContent = `${result.type} · ${timestamp(result.timestamp, true)} · ${currentServer()?.name || ''}`;
     const references = result.references || [];
-    $('#verdict-evidence').innerHTML = `<div class="evidence-summary">${badge(effectivePollution(result))}<span class="tag">${result.override && result.override !== 'auto' ? '人工判定' : '自动判定'}</span><span class="tag">原始：${pollutionLabel(result.pollution)}</span><span class="tag">${escape(result.rcode || '无响应')}</span>${result.received ? `<span class="tag">${number(result.latency_ms)} ms</span>` : ''}</div><p class="evidence-reason">${escape(result.reason || '当前没有可用于判定的充分证据。')}${result.error ? `<br>查询错误：${escape(result.error)}` : ''}</p><section class="evidence-section"><h4>被测服务器的答案</h4><pre class="evidence-answers">${escape(result.answers?.join('\n') || '没有返回答案')}</pre></section><section class="evidence-section"><h4>可信参考 <span class="muted">${references.length} 条</span></h4>${references.length ? references.map(reference => `<div class="reference-item"><div class="reference-heading"><span>${escape(reference.address)} · ${escape(reference.rcode || (reference.success ? '成功' : '失败'))}</span><span>${escape(timestamp(reference.timestamp, true))}</span></div><pre class="evidence-answers">${escape(reference.answers?.join('\n') || reference.error || '没有返回答案')}</pre>${reference.raw ? `<details class="raw-details"><summary>参考原始输出</summary><pre class="evidence-answers">${escape(reference.raw)}</pre></details>` : ''}</div>`).join('') : '<p class="field-help">本条记录没有可信参考。可在服务器管理中启用用户可信 DNS。</p>'}</section>${result.raw ? `<details class="raw-details"><summary>查看 doggo 原始输出</summary><pre class="evidence-answers">${escape(result.raw)}</pre></details>` : ''}`;
+    const legacy = !trustedResult(result) && (result.policy_version || 0) < 2 && result.pollution === 'polluted' && effectivePollution(result) === 'unknown';
+    const reason = trustedResult(result) ? '此服务器由用户指定为可信 DNS，其解析质量固定标为无污染。' : legacy ? '旧版自动判定，仅保留原始证据，不参与当前 E/F 评级。' : result.reason || '当前没有可用于判定的充分证据。';
+    $('#verdict-evidence').innerHTML = `<div class="evidence-summary">${trustedResult(result) ? trustedBadge : `${badge(effectivePollution(result), result.override === 'polluted')}<span class="tag">${result.override && result.override !== 'auto' ? '人工判定' : '自动判定'}</span><span class="tag">原始：${pollutionLabel(result.pollution)}${legacy ? '（旧规则）' : ''}</span>`}<span class="tag">${escape(result.rcode || '无响应')}</span>${result.received ? `<span class="tag">${number(result.latency_ms)} ms</span>` : ''}</div><p class="evidence-reason">${escape(reason)}${result.error ? `<br>查询错误：${escape(result.error)}` : ''}</p><section class="evidence-section"><h4>被测服务器的答案</h4><pre class="evidence-answers">${escape(answerEvidence(result, result.timestamp))}</pre></section><section class="evidence-section"><h4>可信参考 <span class="muted">${references.length} 条</span></h4>${references.length ? references.map(reference => `<div class="reference-item"><div class="reference-heading"><span>${escape(reference.address)} · ${escape(reference.rcode || (reference.success ? '成功' : '失败'))}</span><span>${escape(timestamp(reference.timestamp, true))}</span></div><pre class="evidence-answers">${escape(answerEvidence(reference, result.compared_at || result.timestamp, true))}</pre>${reference.raw ? `<details class="raw-details"><summary>参考原始输出</summary><pre class="evidence-answers">${escape(reference.raw)}</pre></details>` : ''}</div>`).join('') : '<p class="field-help">本条记录没有可信参考。可在服务器管理中启用用户可信 DNS。</p>'}</section>${result.raw ? `<details class="raw-details"><summary>查看 doggo 原始输出</summary><pre class="evidence-answers">${escape(result.raw)}</pre></details>` : ''}`;
     $('#verdict-note').value = '';
     setError('#verdict-error', '');
     $('#verdict-dialog').showModal();
@@ -467,16 +625,17 @@
   async function saveVerdict(verdict) {
     const result = state.result;
     if (!result) return;
+    if (verdict === 'polluted' && trustedResult(result)) return toast('用户可信 DNS 不能标记为污染', true);
     const buttons = $$('[data-verdict]');
     buttons.forEach(button => { button.disabled = true; });
     setError('#verdict-error', '');
     try {
       await api('/overrides', { method: 'PUT', body: { server_id: result.server_id, domain: result.domain, type: result.type, verdict, note: $('#verdict-note').value.trim() } });
       $('#verdict-dialog').close();
-      toast(verdict === 'auto' ? '已恢复自动判定' : verdict === 'clean' ? '已取消该域名的污染判定' : '已将该域名标记为污染');
+      toast(verdict === 'auto' ? '已恢复自动判定' : verdict === 'clean' ? '已将该域名判定为正常' : '已将该域名标记为污染');
       await Promise.allSettled([refreshState(), loadHistory(), loadResults(true)]);
     } catch (error) { setError('#verdict-error', error.message); }
-    finally { buttons.forEach(button => { button.disabled = false; }); }
+    finally { buttons.forEach(button => { button.disabled = button.dataset.verdict === 'polluted' && trustedResult(result); }); }
   }
 
   const chartState = new Map();
@@ -496,7 +655,7 @@
     canvas.height = Math.round(height * scale);
     const context = canvas.getContext('2d');
     context.scale(scale, scale);
-    const padding = { left: 42, right: 12, top: 15, bottom: 30 };
+    const padding = { left: 49, right: 22, top: 18, bottom: 35 };
     const plot = { x: padding.left, y: padding.top, width: width - padding.left - padding.right, height: height - padding.top - padding.bottom };
     const points = state.history;
     const now = state.data?.now || Date.now();
@@ -508,14 +667,14 @@
       const step = 10 ** Math.floor(Math.log10(maximum));
       maximum = Math.ceil(maximum / step) * step;
     }
-    context.font = '9px "Segoe UI", "Microsoft YaHei", sans-serif';
+    context.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
     context.textBaseline = 'middle';
     context.strokeStyle = '#edf1f3';
     context.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = plot.y + plot.height * i / 4;
       context.beginPath(); context.moveTo(plot.x, y); context.lineTo(plot.x + plot.width, y); context.stroke();
-      context.fillStyle = '#a5b2ba'; context.textAlign = 'right';
+      context.fillStyle = '#5e6c75'; context.textAlign = 'right';
       const value = maximum * (4 - i) / 4;
       context.fillText(`${value >= 1000 ? number(value / 1000, 1) + 'k' : number(value, value < 10 ? 1 : 0)}${percentage ? '%' : ''}`, plot.x - 8, y);
     }
@@ -525,15 +684,16 @@
       const label = state.detailRange === '24h' ? new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }) : new Date(time).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
       context.fillText(label, plot.x + plot.width * i / 4, plot.y + plot.height + 19);
     }
-    const valid = percentage ? hasSamples : hasLatency;
+    const valid = percentage ? point => hasCoverage(point) || hasSamples(point) : hasLatency;
     const usable = points.filter(valid);
     if (!usable.length) {
-      context.fillStyle = '#aab8bf';
-      context.font = '11px "Segoe UI", "Microsoft YaHei", sans-serif';
+      context.fillStyle = '#637781';
+      context.font = '13px "Segoe UI", "Microsoft YaHei", sans-serif';
       context.fillText('尚无采样，数据到来后将在这里呈现', plot.x + plot.width / 2, plot.y + plot.height / 2);
     } else {
       const interval = points.length > 1 ? Math.max(1, points[1].timestamp - points[0].timestamp) : ranges[state.detailRange] / 96;
       for (const item of series) {
+        const seriesValid = item.key === 'availability' ? hasCoverage : percentage ? hasSamples : hasLatency;
         context.strokeStyle = item.color;
         context.lineWidth = 1.8;
         context.lineJoin = 'round';
@@ -541,7 +701,7 @@
         let previousTime = 0;
         context.beginPath();
         for (const point of points) {
-          if (!valid(point) || point.timestamp < start || !Number.isFinite(Number(point[item.key]))) { started = false; continue; }
+          if (!seriesValid(point) || point.timestamp < start || !Number.isFinite(Number(point[item.key]))) { started = false; continue; }
           const x = plot.x + (point.timestamp - start) / (end - start) * plot.width;
           const y = plot.y + plot.height - Math.max(0, Math.min(maximum, Number(point[item.key]))) / maximum * plot.height;
           if (started && point.timestamp - previousTime <= interval * 1.6) context.lineTo(x, y); else context.moveTo(x, y);
@@ -551,7 +711,7 @@
         context.stroke();
         context.fillStyle = item.color;
         if (usable.length < 70) for (const point of usable) {
-          if (point.timestamp < start) continue;
+          if (!seriesValid(point) || point.timestamp < start) continue;
           const x = plot.x + (point.timestamp - start) / (end - start) * plot.width;
           const y = plot.y + plot.height - Math.max(0, Math.min(maximum, Number(point[item.key]) || 0)) / maximum * plot.height;
           context.beginPath(); context.arc(x, y, 2.1, 0, Math.PI * 2); context.fill();
@@ -572,7 +732,7 @@
     if (x < data.plot.x || x > data.plot.x + data.plot.width) { tooltip.hidden = true; return; }
     const time = data.start + (x - data.plot.x) / data.plot.width * (data.end - data.start);
     const closest = data.points.reduce((best, point) => Math.abs(point.timestamp - time) < Math.abs(best.timestamp - time) ? point : best);
-    tooltip.innerHTML = `<strong>${escape(timestamp(closest.timestamp))}</strong>${data.series.map(item => `<span>${item.label}：${number(closest[item.key])}${data.percentage ? '%' : ' ms'}</span>`).join('')}<span>${integer(closest.samples)} 次采样</span>`;
+    tooltip.innerHTML = `<strong>${escape(timestamp(closest.timestamp))}</strong>${data.series.map(item => `<span>${item.label}：${(item.key === 'availability' ? hasCoverage(closest) : data.percentage ? hasSamples(closest) : hasLatency(closest)) ? number(closest[item.key]) + (data.percentage ? '%' : ' ms') : '—'}</span>`).join('')}<span>${integer(closest.samples)} 次采样</span>`;
     tooltip.hidden = false;
     tooltip.style.left = `${Math.max(0, Math.min(x + 10, rect.width - tooltip.offsetWidth - 5))}px`;
   }
@@ -619,20 +779,56 @@
     } finally { state.serviceBusy = false; renderService(); }
   }
 
+  function summaryCSVCell(value) {
+    let text = String(value ?? '');
+    if (/^[=+\-@\t\r\n]/.test(text) || /^[\s\uFEFF]*[=+\-@]/.test(text)) text = "'" + text;
+    return '"' + text.replace(/"/g, '""') + '"';
+  }
+
+  function summaryCSV() {
+    const servers = visibleServers();
+    const range = state.loadedRange || state.range;
+    const snapshot = new Date(state.data?.now || Date.now()).toISOString();
+    const headers = ['名称', '供应商', '服务器地址', '协议', '当前状态', '平均时延(ms)', 'P95时延(ms)', '可用率(%)', '查询成功率(%)', '解析质量', '系统评级', '样本数', '覆盖率(%)', '最近探测时间(UTC)', '下次探测时间(UTC)', '统计区间', '数据快照时间(UTC)', '用户可信', '已启用'];
+    const rows = servers.map(server => {
+      const metrics = server.metrics || {};
+      const status = !server.enabled ? '已停用' : !server.last_probe ? '待探测' : server.last_success ? '查询正常' : '查询异常';
+      const grade = displayedGrade(metrics, server.trusted);
+      return [server.name, server.provider, server.address, server.protocol, status, hasLatency(metrics) ? metrics.average_ms : '', hasLatency(metrics) ? metrics.p95_ms : '', hasCoverage(metrics) ? metrics.availability : '', hasSamples(metrics) ? metrics.success_rate : '', server.trusted ? '用户可信 / 无污染' : pollutionLabel(metrics.pollution), ['A', 'B', 'C', 'D', 'E', 'F'].includes(grade) ? grade : '待评估', metrics.samples || 0, metrics.coverage || 0, server.last_probe ? new Date(server.last_probe).toISOString() : '', server.next_due ? new Date(server.next_due).toISOString() : '', range, snapshot, server.trusted ? '是' : '否', server.enabled ? '是' : '否'];
+    });
+    return { text: '\uFEFF' + [headers, ...rows].map(row => row.map(summaryCSVCell).join(',')).join('\r\n') + '\r\n', count: servers.length, range };
+  }
+
+  function exportSummary() {
+    if (!state.data || state.loadedRange !== state.range || state.refreshing) return toast('正在更新所选区间，请等待数据加载后导出', true);
+    const result = summaryCSV();
+    const blob = new Blob([result.text], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'dns-monitor-current-' + result.range + '-' + new Date().toISOString().slice(0, 10) + '.csv';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    toast('已导出当前结果：' + result.count + ' 台服务器，保留当前筛选与排序');
+  }
+
   async function exportCSV(serverID = null) {
-    const button = serverID ? $('#detail-export') : $('#export-button');
-    button.disabled = true;
+    const range = serverID ? state.detailRange : state.range;
+    return downloadCSV('/export?range=' + range + (serverID ? '&server_id=' + serverID : ''), 'dns-monitor-results-' + (serverID || 'all') + '-' + range + '-' + new Date().toISOString().slice(0, 10) + '.csv', serverID ? $('#detail-export') : $('#export-all-results-button'), '原始记录 CSV 已导出');
+  }
+
+  async function downloadCSV(path, filename, button, successMessage = 'CSV 已导出') {
+    if (button) button.disabled = true;
     try {
-      const range = serverID ? state.detailRange : state.range;
-      const filename = `dns-monitor-${serverID || 'all'}-${range}-${new Date().toISOString().slice(0, 10)}.csv`;
-      // Chromium can stream large exports straight to disk instead of buffering a month in memory.
-      const file = typeof window.showSaveFilePicker === 'function' ? await window.showSaveFilePicker({ suggestedName: filename, types: [{ description: 'CSV 原始探测记录', accept: { 'text/csv': ['.csv'] } }] }) : null;
-      const response = await fetch(`/api/export?range=${range}${serverID ? `&server_id=${serverID}` : ''}`, { headers: { 'X-DNSMonitor-Token': state.token }, cache: 'no-store' });
+      const file = typeof window.showSaveFilePicker === 'function' ? await window.showSaveFilePicker({ suggestedName: filename, types: [{ description: 'CSV 文件', accept: { 'text/csv': ['.csv'] } }] }) : null;
+      const response = await fetch('/api' + path, { headers: { 'X-DNSMonitor-Token': state.token }, cache: 'no-store' });
       if (!response.ok) {
         if (response.status === 401) resetSession('会话已失效，请重新登录。');
         let body;
         try { body = await response.json(); } catch { body = null; }
-        throw new Error(body?.error || `导出失败（HTTP ${response.status}）`);
+        throw new Error(body?.error || '导出失败（HTTP ' + response.status + '）');
       }
       if (file && response.body) {
         const output = await file.createWritable();
@@ -648,9 +844,149 @@
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 30000);
       }
-      toast('CSV 已导出，包含所选区间的原始记录');
+      toast(successMessage);
     } catch (error) { if (error.name !== 'AbortError') toast(error.message, true); }
-    finally { button.disabled = false; }
+    finally { if (button) button.disabled = false; }
+  }
+
+  function importConflict(row) {
+    return !!row.duplicate || !!row.existing || Number(row.duplicate_of_row || 0) > 0;
+  }
+
+  function openImport() {
+    if (state.importing?.busy) return toast('导入操作正在执行，请稍候', true);
+    state.importing = { csv: '', filename: '', snapshot: '', rows: [], errors: 0, decisions: new Map(), busy: false };
+    $('#import-file').value = '';
+    $('#import-preview').hidden = true;
+    $('#import-preview-button').disabled = true;
+    $('#import-commit-button').disabled = true;
+    $('#import-status').textContent = '选择文件后将自动预览';
+    setError('#import-error', '');
+    $('#import-dialog').showModal();
+  }
+
+  function importBusy(busy, message = '') {
+    if (!state.importing) return;
+    state.importing.busy = busy;
+    $('#import-file').disabled = busy;
+    $('#import-preview-button').disabled = busy || !state.importing.csv;
+    $('#import-commit-button').disabled = busy || !state.importing.snapshot || state.importing.errors > 0 || !state.importing.rows.length;
+    $$('#import-rows select').forEach(select => { select.disabled = busy; });
+    $('#import-overwrite-all').disabled = busy;
+    $('#import-skip-all').disabled = busy;
+    syncImportBulk();
+    if (message) $('#import-status').textContent = message;
+  }
+
+  async function readImportFile() {
+    const file = $('#import-file').files?.[0];
+    const session = state.importing;
+    if (!file || !session || session.busy) return;
+    session.csv = '';
+    session.snapshot = '';
+    session.rows = [];
+    session.filename = file.name;
+    $('#import-preview').hidden = true;
+    setError('#import-error', '');
+    importBusy(true, '正在读取 CSV 文件…');
+    try {
+      if (file.size > 900 * 1024) throw new Error('CSV 文件超过 900 KiB，请拆分后分别导入。');
+      const bytes = await file.arrayBuffer();
+      if (state.importing !== session) return;
+      let csv;
+      try { csv = new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/, ''); }
+      catch { throw new Error('文件不是有效的 UTF-8 编码，请以 UTF-8 CSV 格式重新保存。'); }
+      if (!csv.trim()) throw new Error('CSV 文件为空，请先填写服务器记录。');
+      if (new TextEncoder().encode(JSON.stringify({ csv })).length >= 1024 * 1024) throw new Error('CSV 的请求内容超过 1 MiB，请拆分后再导入。');
+      session.csv = csv;
+    } catch (error) {
+      setError('#import-error', error.message);
+      $('#import-status').textContent = '文件尚未通过检查';
+    } finally { if (state.importing === session) importBusy(false); }
+    if (session.csv && state.importing === session) await previewImport();
+  }
+
+  async function previewImport() {
+    const session = state.importing;
+    if (!session?.csv || session.busy) return;
+    session.snapshot = '';
+    setError('#import-error', '');
+    importBusy(true, '正在校验服务器与重复项…');
+    try {
+      const preview = await api('/servers/import/preview', { method: 'POST', body: { csv: session.csv } });
+      if (state.importing !== session) return;
+      session.snapshot = preview.snapshot || '';
+      session.rows = preview.rows || [];
+      session.errors = Math.max(Number(preview.errors || 0), session.rows.filter(row => row.error).length);
+      session.decisions = new Map(session.rows.filter(importConflict).map(row => [Number(row.row), 'skip']));
+      if (session.rows.length > 1000) throw new Error('CSV 超过 1000 条记录，请拆分后导入。');
+      renderImport();
+      $('#import-status').textContent = session.errors ? '修正 CSV 中的无效行后，请重新选择文件' : '预览完成，请确认重复项的处理方式';
+    } catch (error) {
+      session.snapshot = '';
+      setError('#import-error', error.message);
+      $('#import-status').textContent = '预览失败，可修正文件后重试';
+    } finally { if (state.importing === session) importBusy(false); }
+  }
+
+  function renderImport() {
+    const session = state.importing;
+    if (!session) return;
+    const conflicts = session.rows.filter(importConflict);
+    const fresh = session.rows.filter(row => !row.error && !importConflict(row)).length;
+    $('#import-preview').hidden = false;
+    $('#import-summary').textContent = session.filename + ' · ' + session.rows.length + ' 行 · ' + fresh + ' 条新记录 · ' + conflicts.length + ' 条重复 · ' + session.errors + ' 条无效';
+    $('#import-rows').innerHTML = session.rows.map(row => {
+      const server = row.server || {};
+      const conflict = importConflict(row);
+      const existing = row.existing;
+      const detail = row.duplicate_of_row ? '与 CSV 数据行 ' + row.duplicate_of_row + ' 重复' : existing ? '已存在：' + (existing.name || existing.address || '') : '与已有服务器重复';
+      const status = row.error ? '<span class="import-row-error">' + escape(row.error) + '</span>' : conflict ? '<span class="import-duplicate">' + escape(detail) + '</span>' : '<span class="import-new">可新增</span>';
+      const action = row.error ? '<span class="muted">请修正</span>' : conflict ? '<select data-import-row="' + Number(row.row) + '" aria-label="数据行 ' + Number(row.row) + ' 的重复项处理"><option value="skip"' + (session.decisions.get(Number(row.row)) === 'skip' ? ' selected' : '') + '>跳过这行</option><option value="overwrite"' + (session.decisions.get(Number(row.row)) === 'overwrite' ? ' selected' : '') + '>覆盖配置</option></select>' : '<span class="import-new">创建服务器</span>';
+      return '<tr><td>' + Number(row.row) + '</td><td><strong>' + escape(server.name || '—') + '</strong><span class="server-secondary">' + escape(server.provider || '未填写供应商') + '</span><span class="import-flags"><span class="tag">' + (server.enabled ? '已启用' : '已停用') + '</span><span class="tag">' + (server.trusted ? '用户可信' : '普通 DNS') + '</span></span></td><td>' + escape(server.address || '—') + '</td><td>' + status + '</td><td>' + action + '</td></tr>';
+    }).join('');
+    syncImportBulk();
+    if (session.errors) setError('#import-error', '存在 ' + session.errors + ' 条无效记录，当前不能导入。请修正原 CSV 文件并重新选择。');
+  }
+
+  function syncImportBulk() {
+    const actions = [...(state.importing?.decisions.values() || [])];
+    $('#import-overwrite-all').checked = actions.length > 0 && actions.every(action => action === 'overwrite');
+    $('#import-skip-all').checked = actions.length > 0 && actions.every(action => action === 'skip');
+    $('#import-overwrite-all').disabled = !actions.length || !!state.importing?.busy;
+    $('#import-skip-all').disabled = !actions.length || !!state.importing?.busy;
+  }
+
+  function bulkImport(action) {
+    const session = state.importing;
+    if (!session || session.busy) return;
+    session.decisions.forEach((_, row) => session.decisions.set(row, action));
+    $$('#import-rows select').forEach(select => { select.value = action; });
+    syncImportBulk();
+  }
+
+  async function commitImport() {
+    const session = state.importing;
+    if (!session?.snapshot || session.busy || session.errors || !session.rows.length) return;
+    const body = { csv: session.csv, snapshot: session.snapshot, decisions: [...session.decisions].map(([row, action]) => ({ row, action })) };
+    if (new TextEncoder().encode(JSON.stringify(body)).length >= 1024 * 1024) return setError('#import-error', '包含处理选项后的请求超过 1 MiB，请拆分 CSV 后导入。');
+    setError('#import-error', '');
+    importBusy(true, '正在写入服务器清单…');
+    try {
+      const result = await api('/servers/import', { method: 'POST', body });
+      $('#import-dialog').close();
+      toast('导入完成：新增 ' + integer(result.created || 0) + '，覆盖 ' + integer(result.updated || 0) + '，跳过 ' + integer(result.skipped || 0));
+      await refreshState();
+    } catch (error) {
+      if (error.status === 409) {
+        session.snapshot = '';
+        setError('#import-error', '服务器清单在预览后发生变化，请点击“重新预览”，重新核对重复项后再导入。');
+        $('#import-status').textContent = '预览已过期，需要重新预览';
+      } else {
+        setError('#import-error', error.message);
+        $('#import-status').textContent = '导入失败，请检查提示后重试';
+      }
+    } finally { if (state.importing === session) importBusy(false); }
   }
 
   function confirmAction(title, description, confirmText = '确认') {
@@ -669,12 +1005,12 @@
 
   $('#login-form').addEventListener('submit', login);
   $('#logout-button').addEventListener('click', logout);
-  $('#refresh-button').addEventListener('click', async () => { await refreshState(); if (state.page === 'service') await refreshService(); });
+  $('#refresh-button').addEventListener('click', manualRefresh);
   $$('.nav-item').forEach(button => button.addEventListener('click', () => navigate(button.dataset.page)));
   $('.sidebar>.brand').addEventListener('click', event => { event.preventDefault(); navigate('overview'); });
   $$('[data-open-guide]').forEach(button => button.addEventListener('click', () => navigate('guide')));
   $$('[data-range]').forEach(button => button.addEventListener('click', () => changeRange(button.dataset.range)));
-  $$('.sort-button').forEach(button => button.addEventListener('click', () => { state.descending = state.sort === button.dataset.sort ? !state.descending : button.dataset.sort !== 'average_ms'; state.sort = button.dataset.sort; renderServerRows(); }));
+  $$('.sort-button').forEach(button => button.addEventListener('click', () => { state.descending = state.sort === button.dataset.sort ? !state.descending : !['average_ms', 'grade'].includes(button.dataset.sort); state.sort = button.dataset.sort; renderServerRows(); }));
   $('#search-filter').addEventListener('input', renderServerRows);
   ['protocol', 'pollution', 'grade'].forEach(filter => $(`#${filter}-filter`).addEventListener('change', renderServerRows));
   $('#add-server-button').addEventListener('click', () => openServer());
@@ -710,7 +1046,17 @@
   $('#result-rows').addEventListener('click', event => { const button = event.target.closest('[data-result-index]'); if (button) showVerdict(Number(button.dataset.resultIndex)); });
   $$('[data-verdict]').forEach(button => button.addEventListener('click', () => saveVerdict(button.dataset.verdict)));
   $('#service-buttons').addEventListener('click', event => { const button = event.target.closest('[data-service-action]'); if (button && !button.disabled) serviceAction(button.dataset.serviceAction); });
-  $('#export-button').addEventListener('click', () => exportCSV());
+  $('#import-servers-button').addEventListener('click', openImport);
+  $('#import-file').addEventListener('change', readImportFile);
+  $('#import-preview-button').addEventListener('click', previewImport);
+  $('#import-commit-button').addEventListener('click', commitImport);
+  $('#import-overwrite-all').addEventListener('change', () => bulkImport('overwrite'));
+  $('#import-skip-all').addEventListener('change', () => bulkImport('skip'));
+  $('#import-rows').addEventListener('change', event => { const select = event.target.closest('[data-import-row]'); if (!select || !state.importing || state.importing.busy) return; state.importing.decisions.set(Number(select.dataset.importRow), select.value); syncImportBulk(); });
+  $('#export-servers-button').addEventListener('click', () => downloadCSV('/servers/export', 'dns-monitor-servers.csv', $('#export-servers-button'), 'DNS 服务器清单已导出'));
+  ['server-template-button', 'import-template-button'].forEach(id => $('#' + id).addEventListener('click', () => downloadCSV('/servers/template', 'dns-monitor-servers-template.csv', $('#' + id), '服务器 CSV 模板已下载，请替换其中的示例行')));
+  $('#export-button').addEventListener('click', exportSummary);
+  $('#export-all-results-button').addEventListener('click', () => exportCSV());
   $('#detail-export').addEventListener('click', () => exportCSV(state.detailID));
   ['rate-chart', 'latency-chart'].forEach(id => { const canvas = $(`#${id}`); canvas.addEventListener('pointermove', chartHover); canvas.addEventListener('pointerleave', () => { $('.chart-tooltip', canvas.parentElement).hidden = true; }); });
   let resizeTimer;

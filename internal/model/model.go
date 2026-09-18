@@ -3,14 +3,15 @@ package model
 import "time"
 
 type Config struct {
-	Listen              string   `json:"listen"`
-	IntervalSeconds     int      `json:"interval_seconds"`
-	TimeoutSeconds      int      `json:"timeout_seconds"`
-	Concurrency         int      `json:"concurrency"`
-	SmartBackoff        bool     `json:"smart_backoff"`
-	MaxBackoffHours     float64  `json:"max_backoff_hours"`
-	ReferenceTTLSeconds int      `json:"reference_ttl_seconds"`
-	Domains             []Domain `json:"domains"`
+	Listen                string   `json:"listen"`
+	IntervalSeconds       int      `json:"interval_seconds"`
+	TimeoutSeconds        int      `json:"timeout_seconds"`
+	Concurrency           int      `json:"concurrency"`
+	SmartBackoff          bool     `json:"smart_backoff"`
+	MaxBackoffHours       float64  `json:"max_backoff_hours"`
+	ReferenceTTLSeconds   int      `json:"reference_ttl_seconds"`
+	ReferenceHistoryHours float64  `json:"reference_history_hours"`
+	Domains               []Domain `json:"domains"`
 }
 type Domain struct {
 	Name string `json:"name"`
@@ -18,48 +19,62 @@ type Domain struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, Domains: []Domain{{Name: "example.com", Type: "A"}, {Name: "cloudflare.com", Type: "A"}}}
+	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, ReferenceHistoryHours: 1, Domains: []Domain{{Name: "www.youtube.com", Type: "A"}}}
 }
 
 type Server struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Provider  string `json:"provider"`
-	Address   string `json:"address"`
-	Protocol  string `json:"protocol"`
-	Enabled   bool   `json:"enabled"`
-	Trusted   bool   `json:"trusted"`
-	Notes     string `json:"notes"`
-	CreatedAt int64  `json:"created_at"`
+	TrustEpoch int64  `json:"-"`
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Provider   string `json:"provider"`
+	Address    string `json:"address"`
+	Protocol   string `json:"protocol"`
+	Enabled    bool   `json:"enabled"`
+	Trusted    bool   `json:"trusted"`
+	Notes      string `json:"notes"`
+	CreatedAt  int64  `json:"created_at"`
 }
+type AnswerRecord struct {
+	Value      string `json:"value"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+	ObservedAt int64  `json:"observed_at"`
+	ExpiresAt  int64  `json:"expires_at"`
+}
+
 type Reference struct {
-	ServerID  int64    `json:"server_id"`
-	Address   string   `json:"address"`
-	Timestamp int64    `json:"timestamp"`
-	Rcode     string   `json:"rcode"`
-	Answers   []string `json:"answers"`
-	Success   bool     `json:"success"`
-	Error     string   `json:"error,omitempty"`
-	Raw       string   `json:"raw,omitempty"`
+	Records   []AnswerRecord `json:"records,omitempty"`
+	ServerID  int64          `json:"server_id"`
+	Address   string         `json:"address"`
+	Timestamp int64          `json:"timestamp"`
+	Rcode     string         `json:"rcode"`
+	Answers   []string       `json:"answers"`
+	Success   bool           `json:"success"`
+	Error     string         `json:"error,omitempty"`
+	Raw       string         `json:"raw,omitempty"`
 }
 type ProbeResult struct {
-	ID         int64       `json:"id"`
-	RoundID    int64       `json:"round_id"`
-	ServerID   int64       `json:"server_id"`
-	Timestamp  int64       `json:"timestamp"`
-	Domain     string      `json:"domain"`
-	Type       string      `json:"type"`
-	Received   bool        `json:"received"`
-	Success    bool        `json:"success"`
-	LatencyMS  float64     `json:"latency_ms"`
-	Rcode      string      `json:"rcode"`
-	Answers    []string    `json:"answers"`
-	Error      string      `json:"error,omitempty"`
-	Raw        string      `json:"raw,omitempty"`
-	Pollution  string      `json:"pollution"`
-	Reason     string      `json:"reason"`
-	References []Reference `json:"references"`
-	Override   string      `json:"override,omitempty"`
+	ComparedAt         int64          `json:"compared_at,omitempty"`
+	Records            []AnswerRecord `json:"records,omitempty"`
+	PolicyVersion      int            `json:"policy_version,omitempty"`
+	EffectivePollution string         `json:"effective_pollution,omitempty"`
+	Trusted            bool           `json:"trusted"`
+	ID                 int64          `json:"id"`
+	RoundID            int64          `json:"round_id"`
+	ServerID           int64          `json:"server_id"`
+	Timestamp          int64          `json:"timestamp"`
+	Domain             string         `json:"domain"`
+	Type               string         `json:"type"`
+	Received           bool           `json:"received"`
+	Success            bool           `json:"success"`
+	LatencyMS          float64        `json:"latency_ms"`
+	Rcode              string         `json:"rcode"`
+	Answers            []string       `json:"answers"`
+	Error              string         `json:"error,omitempty"`
+	Raw                string         `json:"raw,omitempty"`
+	Pollution          string         `json:"pollution"`
+	Reason             string         `json:"reason"`
+	References         []Reference    `json:"references"`
+	Override           string         `json:"override,omitempty"`
 }
 type Round struct {
 	Auxiliary  bool          `json:"auxiliary"`
@@ -102,10 +117,30 @@ type HistoryPoint struct {
 	Metrics
 }
 type RuntimeStatus struct {
-	Active    int    `json:"active"`
-	Paused    bool   `json:"paused"`
-	LastError string `json:"last_error"`
-	StartedAt int64  `json:"started_at"`
+	Refresh   *RefreshStatus `json:"refresh,omitempty"`
+	Active    int            `json:"active"`
+	Paused    bool           `json:"paused"`
+	LastError string         `json:"last_error"`
+	StartedAt int64          `json:"started_at"`
 }
 
 const Retention = 30 * 24 * time.Hour
+
+type RefreshStatus struct {
+	ID        int64  `json:"id"`
+	Total     int    `json:"total"`
+	Completed int    `json:"completed"`
+	Pending   bool   `json:"pending"`
+	Error     string `json:"error,omitempty"`
+}
+type ServerImportItem struct {
+	Row    int    `json:"row"`
+	Key    string `json:"key"`
+	Action string `json:"action"`
+	Server Server `json:"server"`
+}
+type ServerImportResult struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+}

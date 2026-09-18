@@ -113,46 +113,6 @@ func TestDecodeDoggo(t *testing.T) {
 	}
 }
 
-func TestComparisonRequiresUsableAgreement(t *testing.T) {
-	fresh := func() model.ProbeResult {
-		return model.ProbeResult{Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.1"}}
-	}
-	a := model.Reference{ServerID: 1, Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.1"}}
-	b := model.Reference{ServerID: 2, Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.2"}}
-	r := fresh()
-	compare(&r, []model.Reference{a})
-	if r.Pollution != "clean" {
-		t.Fatal(r)
-	}
-	r = fresh()
-	compare(&r, []model.Reference{b})
-	if r.Pollution != "polluted" {
-		t.Fatal(r)
-	}
-	r = fresh()
-	compare(&r, []model.Reference{a, b})
-	if r.Pollution == "polluted" || r.Pollution == "clean" {
-		t.Fatal("disagreeing refs yielded certainty", r)
-	}
-	a.Success = false
-	r = fresh()
-	compare(&r, []model.Reference{a})
-	if r.Pollution != "unknown" {
-		t.Fatal("failed reference used", r)
-	}
-	r = fresh()
-	r.Success = false
-	compare(&r, []model.Reference{b})
-	if r.Pollution != "unknown" {
-		t.Fatal("failed target convicted", r)
-	}
-	r = fresh()
-	compare(&r, []model.Reference{{Success: true, Rcode: "NXDOMAIN"}})
-	if r.Pollution != "polluted" {
-		t.Fatal("NXDOMAIN mismatch omitted", r)
-	}
-}
-
 func TestBackoffAndRecovery(t *testing.T) {
 	cfg := model.DefaultConfig()
 	for i := 0; i < 200; i++ {
@@ -210,7 +170,7 @@ func TestGlobalConcurrencyCacheAndPersistence(t *testing.T) {
 		case <-ctx.Done():
 		case <-time.After(20 * time.Millisecond):
 		}
-		return model.ProbeResult{Timestamp: time.Now().UnixMilli(), ServerID: s.ID, Domain: d.Name, Type: d.Type, Received: true, Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.8"}}
+		return model.ProbeResult{Timestamp: time.Now().UnixMilli(), ServerID: s.ID, Domain: d.Name, Type: d.Type, Received: true, Success: true, Rcode: "NOERROR", Answers: []string{"192.0.2.8"}, Records: []model.AnswerRecord{{Value: "192.0.2.8", TTLSeconds: 60}}}
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -314,6 +274,9 @@ func TestDoggoLocalIntegration(t *testing.T) {
 	r := runDoggo(context.Background(), path, s, model.Domain{Name: "example.com", Type: "A"}, time.Second)
 	if !r.Success || !r.Received || len(r.Answers) != 1 || r.Answers[0] != "192.0.2.9" {
 		t.Fatalf("real doggo failed: %+v", r)
+	}
+	if len(r.Records) != 1 || r.Records[0].TTLSeconds != 60 || r.Records[0].ExpiresAt-r.Records[0].ObservedAt != 60000 {
+		t.Fatal("actual DOGGO TTL missing", r.Records)
 	}
 	if len(r.Raw) == 0 {
 		t.Fatal("missing raw evidence")

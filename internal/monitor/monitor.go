@@ -18,29 +18,35 @@ const maxQueued = 256
 
 type cachedProbe struct{ result model.ProbeResult }
 type completion struct {
-	serverID int64
-	nextDue  int64
-	failures int
+	refreshID int64
+	error     string
+	serverID  int64
+	nextDue   int64
+	failures  int
 }
 
 type Monitor struct {
-	st        *store.Store
-	doggoPath string
-	wake      chan struct{}
-	done      chan completion
-	mu        sync.Mutex
-	config    model.Config
-	status    model.RuntimeStatus
-	queued    map[int64]bool
-	inFlight  map[int64]bool
-	busy      map[int64]bool
-	cache     map[string]cachedProbe
-	changed   chan struct{}
-	probe     func(context.Context, string, model.Server, model.Domain, time.Duration) model.ProbeResult
+	batch                map[int64]bool
+	batchSequence        int64
+	cacheGeneration      uint64
+	st                   *store.Store
+	doggoPath            string
+	wake                 chan struct{}
+	done                 chan completion
+	mu                   sync.Mutex
+	config               model.Config
+	status               model.RuntimeStatus
+	queued               map[int64]bool
+	inFlight             map[int64]bool
+	busy                 map[int64]bool
+	cache                map[string]cachedProbe
+	referenceCollections map[string]*referenceCollection
+	changed              chan struct{}
+	probe                func(context.Context, string, model.Server, model.Domain, time.Duration) model.ProbeResult
 }
 
 func New(st *store.Store, doggoPath string) *Monitor {
-	return &Monitor{st: st, doggoPath: doggoPath, wake: make(chan struct{}, 1), done: make(chan completion, 50), config: model.DefaultConfig(), queued: make(map[int64]bool), inFlight: make(map[int64]bool), busy: make(map[int64]bool), cache: make(map[string]cachedProbe), changed: make(chan struct{}), probe: runDoggo}
+	return &Monitor{st: st, doggoPath: doggoPath, wake: make(chan struct{}, 1), done: make(chan completion, 50), config: model.DefaultConfig(), queued: make(map[int64]bool), inFlight: make(map[int64]bool), busy: make(map[int64]bool), cache: make(map[string]cachedProbe), referenceCollections: make(map[string]*referenceCollection), changed: make(chan struct{}), probe: runDoggo}
 }
 
 func (m *Monitor) Wake() {
@@ -80,7 +86,16 @@ func (m *Monitor) Queue(serverID int64) error {
 	return nil
 }
 
-func (m *Monitor) Status() model.RuntimeStatus { m.mu.Lock(); defer m.mu.Unlock(); return m.status }
+func (m *Monitor) Status() model.RuntimeStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	status := m.status
+	if status.Refresh != nil {
+		refresh := *status.Refresh
+		status.Refresh = &refresh
+	}
+	return status
+}
 func (m *Monitor) setError(err error) {
 	if err != nil {
 		m.mu.Lock()
@@ -109,6 +124,7 @@ func (m *Monitor) Run(ctx context.Context) {
 	}
 	var servers []model.Server
 	var cfg model.Config
+	var pruneAt int64
 	var workers sync.WaitGroup
 	refresh := func() {
 		c, err := m.st.GetConfig()
@@ -156,7 +172,7 @@ func (m *Monitor) Run(ctx context.Context) {
 		allowedServers := make(map[string]bool, len(ss))
 		for _, s := range ss {
 			if s.Enabled && s.Trusted {
-				allowedServers[fmt.Sprintf("%d\x00%s", s.ID, s.Address)] = true
+				allowedServers[fmt.Sprintf("%d\x00%d\x00%s", s.ID, s.TrustEpoch, s.Address)] = true
 			}
 		}
 		allowedDomains := make(map[string]bool, len(c.Domains))
@@ -165,15 +181,25 @@ func (m *Monitor) Run(ctx context.Context) {
 		}
 		for k, v := range m.cache {
 			parts := strings.Split(k, "\x00")
-			validKey := len(parts) == 4 && allowedServers[parts[0]+"\x00"+parts[1]] && allowedDomains[parts[2]+"\x00"+parts[3]]
+			validKey := len(parts) == 5 && allowedServers[parts[0]+"\x00"+parts[1]+"\x00"+parts[2]] && allowedDomains[parts[3]+"\x00"+parts[4]]
 			if !validKey || now-v.result.Timestamp > int64(c.ReferenceTTLSeconds)*1000 {
 				delete(m.cache, k)
 			}
 		}
+		for key, state := range m.referenceCollections {
+			if !allowedDomains[key] && state.done == nil {
+				delete(m.referenceCollections, key)
+			}
+		}
+		m.updateBatchLocked(valid, c.Concurrency == 0)
 		m.config = c
 		m.status.Paused = c.Concurrency == 0
 		m.signalLocked()
 		m.mu.Unlock()
+		if now >= pruneAt || cfg.ReferenceHistoryHours != c.ReferenceHistoryHours {
+			m.setError(m.st.PruneTrustedReferences(now, c.ReferenceHistoryHours))
+			pruneAt = now + time.Minute.Milliseconds()
+		}
 		cfg = c
 		servers = ss
 	}
@@ -189,8 +215,10 @@ func (m *Monitor) Run(ctx context.Context) {
 		m.mu.Lock()
 		sort.SliceStable(candidates, func(i, j int) bool {
 			a, b := candidates[i].ID, candidates[j].ID
-			if m.queued[a] != m.queued[b] {
-				return m.queued[a]
+			manualA := m.queued[a] || m.batchWaitingLocked(a)
+			manualB := m.queued[b] || m.batchWaitingLocked(b)
+			if manualA != manualB {
+				return manualA
 			}
 			return nextDue[a] < nextDue[b]
 		})
@@ -198,22 +226,28 @@ func (m *Monitor) Run(ctx context.Context) {
 			if len(m.inFlight) >= cfg.Concurrency {
 				break
 			}
-			if !s.Enabled || m.inFlight[s.ID] || (!m.queued[s.ID] && nextDue[s.ID] > now) {
+			if !s.Enabled || m.inFlight[s.ID] || (!m.queued[s.ID] && !m.batchWaitingLocked(s.ID) && nextDue[s.ID] > now) {
 				continue
+			}
+			refreshID := int64(0)
+			if m.batchWaitingLocked(s.ID) {
+				m.batch[s.ID] = true
+				refreshID = m.status.Refresh.ID
 			}
 			delete(m.queued, s.ID)
 			m.inFlight[s.ID] = true
 			previous := failures[s.ID]
 			refs := append([]model.Server(nil), servers...)
 			workers.Add(1)
-			go func(s model.Server, c model.Config, previous int, refs []model.Server) {
+			go func(s model.Server, c model.Config, previous int, refs []model.Server, refreshID int64) {
 				defer workers.Done()
 				result := m.runRound(ctx, s, c, refs, previous)
+				result.refreshID = refreshID
 				select {
 				case m.done <- result:
 				case <-ctx.Done():
 				}
-			}(s, cfg, previous, refs)
+			}(s, cfg, previous, refs, refreshID)
 		}
 		m.mu.Unlock()
 	}
@@ -224,11 +258,15 @@ func (m *Monitor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			m.mu.Lock()
+			m.cancelBatchLocked("程序停止，本轮刷新未完成")
+			m.mu.Unlock()
 			workers.Wait()
 			return
 		case completed := <-m.done:
 			m.mu.Lock()
 			delete(m.inFlight, completed.serverID)
+			m.completeBatchLocked(completed)
 			m.mu.Unlock()
 			nextDue[completed.serverID] = completed.nextDue
 			failures[completed.serverID] = completed.failures
@@ -258,27 +296,26 @@ func (m *Monitor) runRound(ctx context.Context, server model.Server, cfg model.C
 		if err != nil || !current.Enabled || current.Address != server.Address {
 			break
 		}
+		server = current
 		result, err := m.lookup(ctx, server, domain, cfg, false)
 		if err != nil {
+			if result.ServerID != 0 {
+				result.Pollution = "unknown"
+				result.Reason = err.Error()
+				round.Results = append(round.Results, result)
+			}
 			break
 		}
-		refs := make([]model.Reference, 0)
-		for _, reference := range servers {
-			if !reference.Enabled || !reference.Trusted || reference.ID == server.ID || sameEndpoint(reference.Address, server.Address) {
-				continue
-			}
-			current, err := m.st.GetServer(reference.ID)
-			if err != nil || !current.Enabled || !current.Trusted || current.Address != reference.Address {
-				continue
-			}
-			ref, err := m.lookup(ctx, reference, domain, cfg, true)
-			if err != nil {
-				continue
-			}
-			refs = append(refs, model.Reference{ServerID: reference.ID, Address: reference.Address, Timestamp: ref.Timestamp, Rcode: ref.Rcode, Answers: ref.Answers, Success: ref.Success, Error: ref.Error})
+		if result.Trusted {
+			round.Results = append(round.Results, result)
+			continue
 		}
-		compare(&result, refs)
+		referenceErr := m.classify(ctx, &result, domain, cfg)
 		round.Results = append(round.Results, result)
+		if referenceErr != nil {
+			break
+		}
+
 	}
 	round.FinishedAt = time.Now().UnixMilli()
 	offline := len(round.Results) > 0
@@ -297,10 +334,14 @@ func (m *Monitor) runRound(ctx context.Context, server model.Server, cfg model.C
 	}
 	delay := nextDelay(cfg, failures, previousFailures)
 	round.NextDue = round.FinishedAt + delay.Milliseconds()
+	completed := completion{serverID: server.ID, nextDue: round.NextDue, failures: failures}
 	if len(round.Results) > 0 {
-		m.setError(m.st.SaveRound(round))
+		if err := m.st.SaveRound(round); err != nil {
+			m.setError(err)
+			completed.error = "保存探测结果失败: " + err.Error()
+		}
 	}
-	return completion{serverID: server.ID, nextDue: round.NextDue, failures: failures}
+	return completed
 }
 
 func nextDelay(cfg model.Config, failures, previousFailures int) time.Duration {
@@ -331,7 +372,7 @@ func nextDelay(cfg model.Config, failures, previousFailures int) time.Duration {
 }
 
 func cacheKey(s model.Server, d model.Domain) string {
-	return fmt.Sprintf("%d\x00%s\x00%s\x00%s", s.ID, s.Address, d.Name, d.Type)
+	return fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%s", s.ID, s.TrustEpoch, s.Address, d.Name, d.Type)
 }
 
 func (m *Monitor) acquire(ctx context.Context, serverID int64) error {
@@ -365,14 +406,26 @@ func (m *Monitor) release(serverID int64) {
 }
 
 func (m *Monitor) lookup(ctx context.Context, server model.Server, domain model.Domain, cfg model.Config, reference bool) (model.ProbeResult, error) {
+	return m.lookupMode(ctx, server, domain, cfg, reference, false)
+}
+
+func (m *Monitor) lookupMode(ctx context.Context, server model.Server, domain model.Domain, cfg model.Config, reference, force bool) (model.ProbeResult, error) {
 	key := cacheKey(server, domain)
 	cacheGet := func() (model.ProbeResult, bool) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		v, ok := m.cache[key]
-		return v.result, ok && cfg.ReferenceTTLSeconds > 0 && time.Now().UnixMilli()-v.result.Timestamp < int64(cfg.ReferenceTTLSeconds)*1000
+		now := time.Now().UnixMilli()
+		valid := ok && v.result.Success && len(v.result.Records) > 0 && cfg.ReferenceTTLSeconds > 0 && now-v.result.Timestamp < int64(cfg.ReferenceTTLSeconds)*1000
+		for _, r := range v.result.Records {
+			if r.TTLSeconds <= 0 || r.ExpiresAt <= now {
+				valid = false
+				break
+			}
+		}
+		return v.result, valid
 	}
-	if reference {
+	if reference && !force {
 		if result, ok := cacheGet(); ok {
 			return result, nil
 		}
@@ -383,7 +436,7 @@ func (m *Monitor) lookup(ctx context.Context, server model.Server, domain model.
 	defer m.release(server.ID)
 	// A concurrent target/reference lookup may have populated the cache while
 	// waiting for the per-server gate. Recheck before spawning another process.
-	if reference {
+	if reference && !force {
 		if result, ok := cacheGet(); ok {
 			return result, nil
 		}
@@ -391,17 +444,70 @@ func (m *Monitor) lookup(ctx context.Context, server model.Server, domain model.
 	if ctx.Err() != nil {
 		return model.ProbeResult{}, ctx.Err()
 	}
-	result := m.probe(ctx, m.doggoPath, server, domain, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	m.mu.Lock()
+	generation := m.cacheGeneration
+	m.mu.Unlock()
 	if server.Trusted {
+		current, err := m.st.GetServer(server.ID)
+		if err != nil || !current.Enabled || !current.Trusted || current.Address != server.Address || current.TrustEpoch != server.TrustEpoch {
+			return model.ProbeResult{}, errors.New("可信来源配置已变化，需重新采集")
+		}
+	}
+	result := m.probe(ctx, m.doggoPath, server, domain, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	result.PolicyVersion = 2
+	result.Timestamp = time.Now().UnixMilli()
+	if len(result.Records) == 0 {
+		for _, value := range result.Answers {
+			if normalized := normalizeAnswer(domain.Type, value); normalized != "" {
+				result.Records = append(result.Records, model.AnswerRecord{Value: normalized})
+			}
+		}
+	}
+	for i := range result.Records {
+		record := &result.Records[i]
+		if record.TTLSeconds < 0 {
+			record.TTLSeconds = 0
+		}
+		if record.TTLSeconds > 86400 {
+			record.TTLSeconds = 86400
+		}
+		record.ObservedAt = result.Timestamp
+		record.ExpiresAt = result.Timestamp + record.TTLSeconds*1000
+	}
+	var sourceErr error
+	if server.Trusted {
+		current, err := m.st.GetServer(server.ID)
+		if err != nil || !current.Enabled || !current.Trusted || current.Address != server.Address || current.TrustEpoch != server.TrustEpoch {
+			sourceErr = errors.New("可信来源配置已变化，丢弃在途参考")
+		}
+	}
+	if server.Trusted && sourceErr == nil {
+		result.Trusted = true
+		result.Pollution = "clean"
+		result.Reason = "用户可信 DNS，不参与污染定罪"
+	}
+	if server.Trusted && sourceErr == nil {
 		m.mu.Lock()
-		m.cache[key] = cachedProbe{result: result}
+		if generation == m.cacheGeneration {
+			// Save only actual observations, never a cache hit. Store rechecks trust epoch
+			// within its transaction to reject revoke/re-enable and address-change races.
+			if result.Success {
+				if err := m.st.SaveTrustedObservation(server, result); err != nil {
+					m.status.LastError = err.Error()
+					sourceErr = fmt.Errorf("保存可信参考失败: %w", err)
+				}
+			}
+			if sourceErr == nil {
+				m.cache[key] = cachedProbe{result: result}
+			}
+		}
 		// Cache bounds also apply to large TXT answers and large server lists.
 		for {
 			total := 0
 			var oldestKey string
 			var oldest int64
 			for k, v := range m.cache {
-				total += len(v.result.Raw) + len(v.result.Error) + 256
+				total += len(v.result.Raw) + len(v.result.Error) + len(v.result.Records)*128 + 256
 				for _, a := range v.result.Answers {
 					total += len(a)
 				}
@@ -421,5 +527,5 @@ func (m *Monitor) lookup(ctx context.Context, server model.Server, domain model.
 		finished := time.Now().UnixMilli()
 		m.setError(m.st.SaveRound(model.Round{Auxiliary: true, ServerID: server.ID, StartedAt: result.Timestamp, FinishedAt: finished, NextDue: finished + int64(cfg.IntervalSeconds)*1000, Results: []model.ProbeResult{result}}))
 	}
-	return result, nil
+	return result, sourceErr
 }

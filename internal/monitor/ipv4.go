@@ -70,11 +70,18 @@ func commandAddress(address string) string {
 	if p == 0 {
 		return "udp://" + addr
 	}
-	// Validation permits only an empty hash list for these transports.
-	if pos >= len(b) || b[pos] != 0 {
-		return address
+	// Validation permits empty hashes only. The stamp VLP encoding may still
+	// contain more than one empty entry, so consume all continuation markers.
+	for {
+		if pos >= len(b) || b[pos]&127 != 0 {
+			return address
+		}
+		more := b[pos]&128 != 0
+		pos++
+		if !more {
+			break
+		}
 	}
-	pos++
 	host, ok := read()
 	if !ok {
 		return address

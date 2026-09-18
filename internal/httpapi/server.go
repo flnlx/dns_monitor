@@ -27,7 +27,7 @@ import (
 	"dnsmonitor/internal/winservice"
 )
 
-const Version = "1.0.0"
+const Version = "1.2.0"
 
 type session struct{ expires time.Time }
 type Server struct {
@@ -110,6 +110,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/session", s.logout)
 	mux.HandleFunc("GET /api/state", s.state)
 	mux.HandleFunc("POST /api/servers", s.saveServer)
+	mux.HandleFunc("POST /api/probes", s.probeAll)
+	mux.HandleFunc("GET /api/servers/export", s.exportServers)
+	mux.HandleFunc("GET /api/servers/template", s.serverTemplate)
+	mux.HandleFunc("POST /api/servers/import/preview", s.previewServerImport)
+	mux.HandleFunc("POST /api/servers/import", s.importServers)
 	mux.HandleFunc("PUT /api/servers/{id}", s.saveServer)
 	mux.HandleFunc("DELETE /api/servers/{id}", s.deleteServer)
 	mux.HandleFunc("GET /api/servers/{id}/history", s.history)
@@ -225,20 +230,11 @@ func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
 		}
 		server.ID = id
 	}
-	server.Name = strings.TrimSpace(server.Name)
-	server.Provider = strings.TrimSpace(server.Provider)
-	server.Notes = strings.TrimSpace(server.Notes)
-	if len(server.Name) == 0 || len(server.Name) > 160 || len(server.Provider) > 160 || len(server.Notes) > 2000 {
-		problem(w, 400, "名称必填且最多 160 字节，备注最多 2000 字节")
-		return
-	}
-	canonical, protocol, e := monitor.ValidateAddress(server.Address)
-	if e != nil {
+	if e := normalizeServerInput(&server); e != nil {
 		problem(w, 400, e)
 		return
 	}
-	server.Address = canonical
-	server.Protocol = protocol
+	var e error
 	server, e = s.Store.SaveServer(server)
 	if e != nil {
 		problem(w, 400, e)
@@ -309,7 +305,13 @@ func (s *Server) probe(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, map[string]bool{"ok": true})
 }
 func (s *Server) config(w http.ResponseWriter, r *http.Request) {
-	var cfg model.Config
+	prior, err := s.Store.GetConfig()
+	if err != nil {
+		problem(w, 500, err)
+		return
+	}
+	// Older clients omit the new history setting; preserve their saved value.
+	cfg := model.Config{ReferenceHistoryHours: prior.ReferenceHistoryHours}
 	if e := decode(w, r, &cfg); e != nil {
 		problem(w, 400, e)
 		return
@@ -353,6 +355,10 @@ func (s *Server) override(w http.ResponseWriter, r *http.Request) {
 	}
 	v.UpdatedAt = time.Now().UnixMilli()
 	if e := s.Store.SaveOverride(v); e != nil {
+		if errors.Is(e, store.ErrTrustedOverride) {
+			problem(w, 400, e)
+			return
+		}
 		problem(w, 500, e)
 		return
 	}
@@ -385,7 +391,7 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename=dns-monitor-results.csv")
 	_, _ = io.WriteString(w, "\xef\xbb\xbf")
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"timestamp", "server_id", "domain", "type", "received", "success", "latency_ms", "rcode", "answers", "detected_pollution", "override", "reason", "error", "references_json", "raw"})
+	_ = cw.Write([]string{"timestamp", "server_id", "domain", "type", "received", "success", "latency_ms", "rcode", "answers", "detected_pollution", "override", "reason", "error", "references_json", "raw", "trusted", "effective_pollution", "records_json", "policy_version", "compared_at"})
 	exportErr := s.Store.WalkResults(id, since, func(p model.ProbeResult) error {
 		select {
 		case <-r.Context().Done():
@@ -393,7 +399,16 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 		refs, _ := json.Marshal(p.References)
-		row := []string{time.UnixMilli(p.Timestamp).Format(time.RFC3339Nano), strconv.FormatInt(p.ServerID, 10), p.Domain, p.Type, strconv.FormatBool(p.Received), strconv.FormatBool(p.Success), strconv.FormatFloat(p.LatencyMS, 'f', 3, 64), p.Rcode, strings.Join(p.Answers, ";"), p.Pollution, p.Override, p.Reason, p.Error, string(refs), p.Raw}
+		records, _ := json.Marshal(p.Records)
+		effective := p.EffectivePollution
+		if effective == "" {
+			effective = p.Pollution
+		}
+		comparedAt := ""
+		if p.ComparedAt > 0 {
+			comparedAt = time.UnixMilli(p.ComparedAt).Format(time.RFC3339Nano)
+		}
+		row := []string{time.UnixMilli(p.Timestamp).Format(time.RFC3339Nano), strconv.FormatInt(p.ServerID, 10), p.Domain, p.Type, strconv.FormatBool(p.Received), strconv.FormatBool(p.Success), strconv.FormatFloat(p.LatencyMS, 'f', 3, 64), p.Rcode, strings.Join(p.Answers, ";"), p.Pollution, p.Override, p.Reason, p.Error, string(refs), p.Raw, strconv.FormatBool(p.Trusted), effective, string(records), strconv.Itoa(p.PolicyVersion), comparedAt}
 		for i := range row {
 			row[i] = csvSafe(row[i])
 		}

@@ -27,7 +27,7 @@ func testStore(t *testing.T) (*Store, model.Server) {
 func round(server, at, duration int64, received, success bool, count int, latency float64, pollution string) model.Round {
 	r := model.Round{ServerID: server, StartedAt: at - 10, FinishedAt: at, NextDue: at + duration}
 	for i := 0; i < count; i++ {
-		r.Results = append(r.Results, model.ProbeResult{Timestamp: at, Domain: "example.com", Type: "A", Received: received, Success: success, LatencyMS: latency, Pollution: pollution, Answers: []string{"93.184.216.34"}})
+		r.Results = append(r.Results, model.ProbeResult{PolicyVersion: 2, Timestamp: at, Domain: "example.com", Type: "A", Received: received, Success: success, LatencyMS: latency, Pollution: pollution, Answers: []string{"93.184.216.34"}})
 	}
 	return r
 }

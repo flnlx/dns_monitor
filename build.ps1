@@ -1,5 +1,8 @@
 param([switch]$SkipTests)
 $ErrorActionPreference = 'Stop'
+# Keep script source ASCII for Windows PowerShell 5.1 ANSI decoding.
+$readmeFileName = (-join [char[]](0x4F7F, 0x7528, 0x8BF4, 0x660E)) + '.md'
+$validationFileName = (-join [char[]](0x9A8C, 0x6536, 0x8BB0, 0x5F55)) + '.md'
 Set-Location -LiteralPath $PSScriptRoot
 $goCmd = Get-Command go -ErrorAction SilentlyContinue
 $goExe = if ($goCmd) { $goCmd.Source } else { Join-Path $PSScriptRoot '.tools\go\bin\go.exe' }
@@ -17,9 +20,9 @@ New-Item -ItemType Directory -Force dist\DNSMonitor\doggo, dist\DNSMonitor\licen
 & $goExe build -trimpath -ldflags '-s -w' -o dist\DNSMonitor\dns-monitor.exe ./cmd/dns-monitor
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 Copy-Item -LiteralPath doggo\doggo.exe,doggo\LICENSE,doggo\README.md,doggo\DOGGOHELP.TXT -Destination dist\DNSMonitor\doggo -Force
-Copy-Item -LiteralPath README.md -Destination dist\DNSMonitor\使用说明.md -Force
+Copy-Item -LiteralPath README.md -Destination (Join-Path 'dist\DNSMonitor' $readmeFileName) -Force
 Copy-Item -LiteralPath start.cmd,manage-service.cmd -Destination dist\DNSMonitor -Force
-if (Test-Path -LiteralPath VALIDATION.md) { Copy-Item -LiteralPath VALIDATION.md -Destination dist\DNSMonitor\验收记录.md -Force }
+if (Test-Path -LiteralPath VALIDATION.md) { Copy-Item -LiteralPath VALIDATION.md -Destination (Join-Path 'dist\DNSMonitor' $validationFileName) -Force }
 $moduleList = (& $goExe version -m dist\DNSMonitor\dns-monitor.exe) -join "`n"
 if ($LASTEXITCODE -ne 0) { throw 'Cannot collect dependency licenses' }
 $moduleDirs = & $goExe list -deps -f '{{with .Module}}{{.Path}}|{{.Dir}}{{end}}' ./cmd/dns-monitor | Sort-Object -Unique
