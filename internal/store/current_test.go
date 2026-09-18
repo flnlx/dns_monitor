@@ -237,3 +237,48 @@ func TestCurrentThresholdsAndMutationsInvalidateSummaryCache(t *testing.T) {
 		t.Fatalf("manual reset left stale current: %+v", got)
 	}
 }
+
+func TestCurrentUnavailableOverridesTrustAndRecovers(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		for _, received := range []bool{false, true} {
+			s, server := testStore(t)
+			server.Trusted = trusted
+			if _, err := s.SaveServer(server); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-time.Hour).UnixMilli()
+			// A first failure must not wait for sample or coverage thresholds.
+			mustSave(t, s, round(server.ID, at, currentMinute, received, false, 1, 0, "unknown"))
+			if got := currentAt(t, s, server.ID, at); got.Grade != "unavailable" || got.Score != 0 || got.PendingReason != "" {
+				t.Fatalf("first failure trusted=%v received=%v: %+v", trusted, received, got)
+			}
+			// Historical successes must not hide a new failed round.
+			mustSave(t, s, round(server.ID, at+currentMinute, 30*currentMinute, true, true, 100, 10, "matched"))
+			mustSave(t, s, round(server.ID, at+31*currentMinute, currentMinute, received, false, 1, 0, "unknown"))
+			summary, err := s.Summary(at, at+32*currentMinute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := summary[0].Current; got.Grade != "unavailable" || got.Score != 0 || got.SuccessRate < 95 {
+				t.Fatalf("old successes masked current failure: %+v", got)
+			}
+			// Auxiliary success cannot clear the formal failure.
+			aux := round(server.ID, at+32*currentMinute, currentMinute, true, true, 1, 10, "matched")
+			aux.Auxiliary = true
+			mustSave(t, s, aux)
+			if got := currentAt(t, s, server.ID, at+32*currentMinute); got.Grade != "unavailable" {
+				t.Fatalf("auxiliary cleared outage: %+v", got)
+			}
+			// Partial success is degraded service, not complete unavailability.
+			recovery := round(server.ID, at+33*currentMinute, currentMinute, true, true, 2, 10, "matched")
+			recovery.Results[1].Success = false
+			mustSave(t, s, recovery)
+			if got := currentAt(t, s, server.ID, at+34*currentMinute); got.Grade != "A" {
+				t.Fatalf("recovery failed: %+v", got)
+			}
+			if got := currentAt(t, s, server.ID, at+94*currentMinute); got.Grade != "pending" || got.PendingReason != "no_samples" {
+				t.Fatalf("stale status: %+v", got)
+			}
+		}
+	}
+}

@@ -114,12 +114,23 @@ func TestHistoryAndSummaryExposeCurrentEvaluation(t *testing.T) {
 			t.Fatal(response.Code, response.Body.String())
 		}
 		var result struct {
-			Points  []model.HistoryPoint    `json:"points"`
-			Metrics model.Metrics           `json:"metrics"`
-			Current model.CurrentEvaluation `json:"current"`
+			StatusHistory []model.StatusBucket    `json:"status_history"`
+			Points        []model.HistoryPoint    `json:"points"`
+			Metrics       model.Metrics           `json:"metrics"`
+			Current       model.CurrentEvaluation `json:"current"`
 		}
 		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 			t.Fatal(err)
+		}
+		if len(result.StatusHistory) != map[string]int{"24h": 48, "7d": 56, "30d": 60}[span] {
+			t.Fatal("missing status history", span, len(result.StatusHistory))
+		}
+		var snapshots int64
+		for _, point := range result.StatusHistory {
+			snapshots += point.Snapshots
+		}
+		if snapshots != 4 {
+			t.Fatal("wrong snapshot count", snapshots)
 		}
 		if len(result.Points) == 0 || result.Metrics.Grade != "F" || result.Metrics.Pollution != "polluted" {
 			t.Fatalf("history contract lost historical metrics: %+v", result)
@@ -138,6 +149,9 @@ func TestHistoryAndSummaryExposeCurrentEvaluation(t *testing.T) {
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
+	}
+	if len(state.Servers) != 1 || len(state.Servers[0].StatusHistory) != 60 {
+		t.Fatal("state missing compact status history")
 	}
 	if state.Version != "1.3.0" || len(state.Servers) != 1 || state.Servers[0].Metrics.Grade != "F" || state.Servers[0].Current.Grade != "A" {
 		t.Fatalf("state contract lost current or historical evaluation: %+v", state)

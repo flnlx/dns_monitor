@@ -36,3 +36,18 @@ body{font-size:16px;line-height:1.55}h1,.topbar h1{font-size:32px;font-weight:65
 
 /* Resolution quality distinguishes fresh references, history, and automatic alerts. */
 .pollution-badge.matched{color:#276b84;background:#eaf4f9}.pollution-badge.clean{color:#3f6f58;background:#f1f7f2}.pollution-badge.suspicious{color:#886016;background:#fff5dd}.pollution-badge.polluted{color:#a24750;background:#fcf0f0}.grade-e{color:#886016;background:#fff2cf}.grade-f{color:#a24750;background:#fbebec}.domain-button.suspicious{color:#886016}.domain-button.polluted{color:#a24750}.summary-card.warning .summary-value{color:#886016}.summary-card.warning .summary-icon{color:#886016;background:#fff5dd}
+
+.grade-unavailable{width:auto;padding:0 7px;background:#fbebec;color:#b84f5c}
+
+/* Immutable probe-status history: aligned observation buckets, not uptime bars. */
+.history-open{display:block;width:148px;margin:9px 0 0;padding:0;border:0;background:none;text-align:left;cursor:pointer;color:var(--muted)}
+.status-strip{display:flex;gap:2px;width:100%;min-width:0}.status-block{display:block;flex:1 1 0;min-width:0;height:17px;border:0;border-radius:2px;padding:0}
+.history-open .status-strip{gap:1px}.history-open .status-block{height:12px;border-radius:1px}.history-caption{display:block;font-size:11px;margin-top:4px}
+.history-open:focus-visible,.status-block:focus-visible{outline:2px solid var(--ink);outline-offset:3px}.history-open:hover .history-caption{color:var(--teal)}
+.status-history{padding:19px 21px;border:1px solid var(--line);border-radius:12px;margin:0 0 20px;background:#fff}
+.status-history-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.status-history-heading h4{font-size:14px;margin:0}.status-history-heading>span,.status-axis{font-size:11px;color:var(--muted)}
+.status-track{margin-top:16px}.status-track h5{font-size:12px;margin:0 0 8px;color:var(--ink)}.status-track .status-block{height:26px;cursor:pointer}.status-track .status-block:hover{outline:2px solid var(--ink);outline-offset:2px}
+.status-legend{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:9px;font-size:11px;color:var(--muted)}.status-legend>span{display:inline-flex;align-items:center;gap:5px}.status-legend i{width:9px;height:9px;border-radius:2px}
+.status-axis{display:flex;justify-content:space-between;margin-top:14px}.status-inspection{font-size:12px;line-height:1.8;padding:12px;background:#f5f8f8;border-radius:7px;margin:13px 0 8px;min-height:65px;color:var(--ink)}
+.status-matched{background:#5b9cba}.status-clean,.status-a{background:#4d9975}.status-b{background:#69b4a5}.status-c{background:#7d9fb9}.status-d{background:#d39364}.status-suspicious,.status-e{background:#d7ab45}.status-polluted,.status-f{background:#cf6d76}.status-unknown,.status-pending{background:#9baabd}.status-unavailable{background:repeating-linear-gradient(45deg,#555665 0 3px,#777988 3px 5px)}.status-no_data{background:repeating-linear-gradient(135deg,#e6e9ed 0 3px,#f5f6f8 3px 5px)}
+@media(max-width:600px){.status-history{padding:14px 12px}.status-strip.expanded{gap:1px}.status-history-heading{align-items:flex-start}.status-legend{gap:6px 10px}.status-inspection{min-height:90px}}

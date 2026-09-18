@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 
 	"dnsmonitor/internal/model"
@@ -21,6 +22,15 @@ func (s *Store) CurrentEvaluation(serverID, now int64) (model.CurrentEvaluation,
 }
 
 func (s *Store) currentEvaluation(server model.Server, config model.Config, now int64) (model.CurrentEvaluation, error) {
+	return evaluateCurrent(s.db, server, config, now)
+}
+
+type evaluationReader interface {
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
+}
+
+func evaluateCurrent(db evaluationReader, server model.Server, config model.Config, now int64) (model.CurrentEvaluation, error) {
 	value := model.CurrentEvaluation{
 		WindowMinutes:      config.RatingWindowMinutes,
 		MinSamples:         config.RatingMinSamples,
@@ -51,13 +61,13 @@ func (s *Store) currentEvaluation(server model.Server, config model.Config, now 
  COALESCE(SUM(MAX(0,MIN(covered_until,?)-MAX(finished_at,?))*1.0*received/MAX(1,samples)),0),
  COALESCE(MAX(CASE WHEN finished_at>=? THEN finished_at ELSE 0 END),0)
  FROM eligible`
-	err := s.db.QueryRow(query, server.ID, since, now, server.ID, since, since,
+	err := db.QueryRow(query, server.ID, since, now, server.ID, since, since,
 		since, since, since, since, since, now, since, now, since, since).
 		Scan(&a.m.Samples, &received, &a.successes, &a.latencyCount, &a.latencySum, &a.covered, &a.available, &value.QualityAt)
 	if err != nil {
 		return value, err
 	}
-	rows, err := s.db.Query(`SELECT b.bucket_ms,SUM(b.count) FROM rounds r JOIN latency_buckets b ON b.round_id=r.id
+	rows, err := db.Query(`SELECT b.bucket_ms,SUM(b.count) FROM rounds r JOIN latency_buckets b ON b.round_id=r.id
  WHERE r.server_id=? AND r.auxiliary=0 AND r.finished_at>=? AND r.finished_at<=? GROUP BY b.bucket_ms`, server.ID, since, now)
 	if err != nil {
 		return value, err
@@ -76,6 +86,18 @@ func (s *Store) currentEvaluation(server model.Server, config model.Config, now 
 		return value, err
 	}
 
+	// Reachability/lookup failure is independent of trust and historical scores.
+	// Only the latest formal round inside the rating window can establish it.
+	var latestSamples, latestSuccesses int64
+	if value.QualityAt > 0 {
+		err = db.QueryRow(`SELECT samples,successes FROM rounds
+ WHERE server_id=? AND auxiliary=0 AND finished_at>=? AND finished_at<=?
+ ORDER BY finished_at DESC,id DESC LIMIT 1`, server.ID, since, now).Scan(&latestSamples, &latestSuccesses)
+		if err != nil {
+			return value, err
+		}
+	}
+
 	if server.Trusted {
 		a.pollution = 1
 	} else if value.QualityAt > 0 {
@@ -83,7 +105,7 @@ func (s *Store) currentEvaluation(server model.Server, config model.Config, now 
 		// Unknown A answers outrank matched/clean answers in the latest round.
 		// Other types are not automatically comparable, but an explicit manual
 		// verdict (effective_pollution > 0) still participates.
-		err = s.db.QueryRow(`SELECT COALESCE(MAX(CASE effective_pollution
+		err = db.QueryRow(`SELECT COALESCE(MAX(CASE effective_pollution
  WHEN 4 THEN 5 WHEN 3 THEN 4 WHEN 0 THEN 3 WHEN 2 THEN 2 WHEN 1 THEN 1 ELSE 3 END),0)
  FROM results WHERE round_id=(SELECT id FROM rounds WHERE server_id=? AND auxiliary=0 AND finished_at>=? AND finished_at<=? ORDER BY finished_at DESC,id DESC LIMIT 1)
  AND (type='A' OR effective_pollution>0)`, server.ID, since, now).Scan(&severity)
@@ -110,6 +132,9 @@ func (s *Store) currentEvaluation(server model.Server, config model.Config, now 
 	value.CoveredMinutes = a.covered / 60000
 	value.Metrics = a.finishWithThresholds(window, int64(value.MinSamples), int64(value.MinCoverageMinutes)*60000)
 	switch {
+	case latestSamples > 0 && latestSuccesses == 0:
+		value.Grade = "unavailable"
+		value.Score = 0
 	case a.pollution >= 3:
 		// A current suspicious/polluted answer is actionable even before warm-up.
 	case value.Samples == 0:

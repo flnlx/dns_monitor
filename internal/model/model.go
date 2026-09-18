@@ -117,6 +117,7 @@ type CurrentEvaluation struct {
 	PendingReason      string  `json:"pending_reason"`
 }
 type ServerSummary struct {
+	StatusHistory []StatusBucket `json:"status_history"`
 	Server
 	Current     CurrentEvaluation `json:"current"`
 	Metrics     Metrics           `json:"metrics"`
@@ -125,6 +126,25 @@ type ServerSummary struct {
 	LastSuccess bool              `json:"last_success"`
 	Failures    int               `json:"failures"`
 }
+
+// StatusBucket summarizes immutable evaluations captured at formal probe completion.
+// Colors represent the worst observed status, never a duration or interpolated uptime.
+type StatusBucket struct {
+	Timestamp     int64               `json:"timestamp"`
+	End           int64               `json:"end"`
+	Snapshots     int64               `json:"snapshots"`
+	Pollution     string              `json:"pollution"`
+	Grade         string              `json:"grade"`
+	QualityCounts map[string]int64    `json:"quality_counts,omitempty"`
+	GradeCounts   map[string]int64    `json:"grade_counts,omitempty"`
+	Latest        *EvaluationSnapshot `json:"latest,omitempty"`
+}
+type EvaluationSnapshot struct {
+	Timestamp int64             `json:"timestamp"`
+	Trusted   bool              `json:"trusted"`
+	Current   CurrentEvaluation `json:"current"`
+}
+
 type HistoryPoint struct {
 	Timestamp int64 `json:"timestamp"`
 	Metrics

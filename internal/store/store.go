@@ -70,6 +70,13 @@ CREATE TABLE IF NOT EXISTS override_audit (
  domain TEXT NOT NULL, type TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT NOT NULL, timestamp INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_time ON override_audit(timestamp);
+CREATE TABLE IF NOT EXISTS evaluation_snapshots (
+ round_id INTEGER PRIMARY KEY REFERENCES rounds(id) ON DELETE CASCADE,
+ server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+ timestamp INTEGER NOT NULL, pollution TEXT NOT NULL, grade TEXT NOT NULL,
+ trusted INTEGER NOT NULL, evaluation TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS evaluation_server_time ON evaluation_snapshots(server_id,timestamp,round_id,pollution,grade);
 `
 
 func Open(path string) (*Store, error) {
@@ -322,6 +329,11 @@ func (s *Store) SaveRound(v model.Round) error {
 	}
 	for bucket, n := range buckets {
 		if _, err = tx.Exec("INSERT INTO latency_buckets(round_id,bucket_ms,count) VALUES(?,?,?)", roundID, bucket, n); err != nil {
+			return err
+		}
+	}
+	if !v.Auxiliary {
+		if err = saveEvaluationSnapshot(tx, v.ServerID, roundID, v.FinishedAt); err != nil {
 			return err
 		}
 	}
@@ -808,6 +820,10 @@ func (s *Store) Summary(since, now int64) ([]model.ServerSummary, error) {
 			if err != nil {
 				return nil, err
 			}
+		}
+		value.StatusHistory, err = s.StatusHistory(v.ID, since, now, false)
+		if err != nil {
+			return nil, err
 		}
 		values = append(values, value)
 	}

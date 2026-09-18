@@ -273,7 +273,12 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, e)
 		return
 	}
-	jsonOut(w, 200, map[string]any{"points": points, "metrics": metrics, "current": current})
+	statusHistory, e := s.Store.StatusHistory(id, since, now, true)
+	if e != nil {
+		problem(w, 500, e)
+		return
+	}
+	jsonOut(w, 200, map[string]any{"points": points, "metrics": metrics, "current": current, "status_history": statusHistory})
 }
 func (s *Server) results(w http.ResponseWriter, r *http.Request) {
 	id, e := idFrom(r)
