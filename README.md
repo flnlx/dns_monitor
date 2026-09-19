@@ -1,5 +1,7 @@
 # DNS Monitor
 
+> 英文版：[README.en.md](README.en.md)
+
 本地运行的 Windows IPv4 DNS 监测工具。Go 后端、原生网页、SQLite 存储，使用同目录 DOGGO 发送 DNS 请求。无需安装运行时，无在线网页依赖。
 
 ## 启动与移动

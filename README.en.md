@@ -1,0 +1,154 @@
+# DNS Monitor
+
+> Chinese version: [README.md](README.md)
+
+A locally run IPv4 DNS monitoring tool for Windows. Go backend, native web UI, SQLite storage, and bundled DOGGO in the same directory to send DNS requests. No runtime to install, no online web dependencies.
+
+## Starting and Moving
+
+1. Unzip `dist/DNSMonitor-windows-amd64.zip`, or open `dist/DNSMonitor`.
+2. Double-click `start.cmd`. The web UI defaults to `http://127.0.0.1:8080`, and the server listens on `0.0.0.0:8080` by default.
+3. The first run generates `data/access-key.txt`. Paste the key from that file into the login page; the same key is used for local and LAN access. Sessions live only in browser memory, so a refresh requires signing in again, and they expire after 12 hours.
+4. Add servers and providers; in the server form, tick the DNS servers you consider trusted; configure a domain, then start monitoring.
+
+Data and configuration are stored in `data/monitor.db`, with rolling logs under `logs`. After closing the program, copy the **entire folder** to migrate. Stop the program normally before backing up as well; while running, SQLite may also use `.db-wal` and `.db-shm`. Do not copy only the `.db` file that is in use.
+
+Before upgrading, close the old program and back up `data`, then replace the program and bundled files and start it again. v1.2 upgrades the database automatically, and trusted history migrates together with the data directory; to roll back to an older version, use the data backup taken before the upgrade.
+
+Only Windows 10/11, Windows Server 2016 and later on amd64, over IPv4 transport, are supported. No Windows firewall exception is created. LAN reachability depends on your existing firewall configuration; the default HTTP setup suits trusted local networks, while untrusted networks should go through an existing HTTPS reverse proxy or VPN.
+
+## Monitoring and Statistics
+
+- Monitors server reachability, average and P95 latency, and query success rate; filter by protocol, provider, pollution status, and rating, sorted by current rating by default, with an option to sort by latency.
+- Supports 24-hour, 7-day, and 30-day views. Raw probe records, answers, and trusted-source evidence are kept on a rolling 30-day basis, and expired data is purged at startup and hourly thereafter. After purging, the SQLite file space is reusable, though the file is not guaranteed to shrink immediately.
+- Receiving a DNS response means the server is reachable; NOERROR with the corresponding record, or an explicit NXDOMAIN negative answer, counts as a successful query. An empty answer with no recognizable response code does not count as success. Records do not use ICMP, and a DNS timeout is not reported as an actual network packet-loss rate.
+- Availability is weighted by observed time; query success rate is computed from actual query counts. No success records are fabricated during failure backoff; uncovered time while the program is stopped is left as a gap. Coverage helps distinguish "not yet monitored" from "service failure".
+- Latency uses the query duration reported by DOGGO; P95 uses histogram statistics rounded up to 1 ms, with an error of no more than 1 ms. Trend charts use aggregated data; raw records support CSV export.
+
+## Probe Configuration
+
+The default interval is 300 seconds, timeout 3 seconds, and concurrency 2. The concurrency range is **0-50**, and **0 pauses all new probes**, including manual triggers. In-flight requests finish within their timeout bound.
+
+Intelligent penalty progressively lengthens the interval for servers that fail repeatedly, with a maximum backoff of **0-24 hours**, defaulting to **1 hour**. **0 disables backoff.** The backoff ceiling is never set below the base interval, and the scheduler adds 0-10% negative jitter, never shorter than 5 seconds. Staggering, jitter, a bounded task queue, and a no-overlap rule per server limit instantaneous load. The first recovery after a long offline period is re-checked within about 30 seconds, after which the base interval resumes. Changing the listen address requires a restart; all other settings take effect live.
+
+New configurations probe **www.youtube.com / A** by default. Existing configurations keep their saved domains, and you can add or remove multiple probe domains and record types. The IPv4-only restriction applies to the network transport used to reach DNS and to server addresses. Domains must be ASCII/Punycode; URLs are not accepted, and IPv6 upstreams are not supported.
+
+Addresses use the common AdGuard Home upstream syntax, for example:
+
+```text
+1.1.1.1
+8.8.8.8:53
+udp://9.9.9.9:53
+tcp://1.1.1.1
+tls://dns.google
+https://cloudflare-dns.com/dns-query
+h3://dns.google/dns-query
+quic://dns.adguard-dns.com
+sdns://...
+```
+
+DNS stamps support plain UDP, IPv4 DNSCrypt, and DoH/DoT/DoQ without fixed IPs, certificate hashes, or bootstrap constraints. The bundled DOGGO cannot correctly preserve these encrypted-stamp constraints and explicitly rejects them; supply the corresponding standard upstream URL instead. AdGuard Home domain-specific routing directives (such as `[/example.com/]...`), the special `#` system-default upstream, and insecure TLS options are not valid addresses for a single server under test and are explicitly rejected on save. Resolving a domain upstream at startup depends on an IPv4 DNS server available to the host; this project does not modify system DNS. Probe isolation inherits the DOGGO configuration and HTTP(S) proxy environment variables and measures the DNS access path directly. Encrypted protocols additionally bind an IPv4 source and retain TLS certificate verification.
+
+## Trusted References and Four-Tier Assessment
+
+In server management, the user designates trusted DNS servers. The system builds a reference pool only from IPv4 answers for the same domain and A record; it never mixes different domains, and ordinary monitored servers never extend the trusted references.
+
+- **Fresh reference**: addresses actually returned by a trusted DNS server whose TTL has not yet expired; when a CNAME resolution chain is present, the shorter TTL among the chain and the A records is used. TTL is capped at 24 hours, and missing, invalid, or zero TTLs do not count as fresh references.
+- **Recent history**: addresses a trusted DNS server has actually returned recently, kept for **1 hour** by default, configurable from **0-720 hours**, with fractional values allowed; 0 disables history references. The window is measured from the last actual observation, and failed queries and cache reads do not extend history. Records whose TTL is still valid can still serve as fresh references.
+- The reference pool is persistent and keeps using valid records after a restart. Untrusting, disabling, or changing a source address clears that source's references; re-enabling or re-trusting requires fresh collection. Each source/domain/type holds at most 256 addresses, and the global limit is 16384; when a limit is reached, the least recently observed entries are evicted.
+
+Each returned IP is compared independently, and an answer takes the worst tier:
+
+| Resolution status | Criteria | Overall rating |
+| --- | --- | --- |
+| Reference match | All IPs hit fresh references | Graded A-D by performance, or pending assessment |
+| Normal | All IPs hit fresh references or valid history; some hit history only | Graded A-D by performance, or pending assessment |
+| Suspicious | Unseen IPs are present, but all of them match the first two IPv4 octets (/16) of a reference pool entry | E |
+| Suspected pollution | At least one IP misses the reference pool and its first two octets do not match either | F |
+
+The prefix set comes from fresh references and history still within its retention window. A matching prefix does not guarantee safety, and a different prefix may also be normal CDN scheduling; E/F are automatic rule-based tiers and must not be treated as independently verified pollution. When there is no usable reference, no comparable IPv4, or a failed query, the status shows as pending, and an empty set alone is never treated as guilty. Non-A queries can still monitor availability and latency but do not apply the IPv4 prefix rule.
+
+Each assessment directly uses the currently valid fresh references and history set, and **does not require every trusted DNS server to have responded or every reference to be unexpired**. One source being offline, timing out, or having expired references does not prevent other sources' valid addresses from determining the four-tier result; no forced re-query is required before assigning E/F either. Normal scheduled probes of trusted DNS servers keep extending the set.
+
+Supplemental collection is attempted only when no valid reference exists at all, and the first usable reference is enough to decide; collection is shared per domain, and an empty pool is retried no more often than every 30 seconds. The trusted query cache defaults to a 300-second ceiling and is also bounded by the actual TTL; TTL expiry does not trigger proactive high-frequency traffic. All queries remain subject to the global concurrency limit. Manual refresh requires fresh actual probes and preserves trusted history.
+
+**Servers a user designates as trusted are never rated E/F**, and their resolution quality shows "User-trusted / No pollution", while performance still shows A-D or pending assessment. For other servers, you can click a domain to manually confirm pollution, clear pollution, or restore automatic assessment; the manual decision persists for that server, domain, and record type. Manual confirmation shows confirmed pollution, clearing pollution shows normal, and the original automatic result and evidence are retained.
+
+When upgrading from an older version, automatic F results produced by the old algorithm retain only their raw evidence, and their effective status becomes pending so they no longer affect E/F ratings in the new version; historical manual decisions are preserved.
+
+The overview's **current resolution quality** takes the latest formal round within the rating window; when the window has no samples, non-trusted DNS servers show pending, with priority F, E, pending, normal, reference match. If an A query in a round is pending, it is not masked by another normal answer in the same round; automatic pending for non-A queries does not affect the A queries in the same round. A normal or E/F status in history no longer blocks current-state updates. Only an auxiliary trusted-query change, by itself, does not update the current state of a monitored server.
+
+**Current rating** observes only the last **60 minutes** by default and requires at least **3 formal samples and 5 minutes of valid coverage**. With a single domain and a 5-minute interval, a rating typically forms in about 10 minutes. Three settings can be adjusted under "Probe Configuration -> Current State and Rating": observation window 5-1440 minutes, minimum samples 1-100, and minimum coverage 0-1440 minutes, which cannot exceed the observation window; a minimum coverage of 0 adds no extra waiting. Manual refresh can add real samples but never increases covered duration artificially. Changing the parameters recomputes directly over existing evidence, with no need to clear data.
+
+When every query in the latest formal round fails (connection failure, timeout, or resolution error), the current rating immediately shows **Unavailable**, the current score is 0, and this takes priority over pollution ratings and the sample threshold; trusted markers do not exempt a server. Once the latest round has a successful query, normal rating rules resume, and a window with no formal samples is still pending assessment. Historical metrics are unaffected.
+
+A current F/E takes priority over the sample threshold; when a non-trusted server's current resolution quality is pending, its current overall rating also shows pending assessment, and hovering explains the reason, sampling, and coverage progress. Pending does not mean pollution: it may be a failed query, no comparable A records, or insufficient trusted references. Performance metrics and the recent performance score are still retained, and the current-summary CSV can still be exported. Trusted servers are exempt from the effect of E/F and pending resolution on rating but still must meet the performance sampling threshold.
+
+Everything else is scored from 45% availability, 35% query success rate, and 20% P95 latency to yield A-D (A >= 95, B >= 85, C >= 70, otherwise D). A P95 of <= 50 ms earns the full latency score, >= 2000 ms scores zero, and values in between decrease linearly. When the current window has no formal samples, the rating returns to pending assessment; prolonged offline backoff can lead to insufficient recent samples, which you can address by adjusting the observation window while keeping the evidence threshold.
+
+Latency, availability, and success rate in the table, and the detail charts, continue to use the selected **24-hour / 7-day / 30-day** range. Historical aggregate metrics keep the most severe known resolution result in the range plus the original 10-sample / 30-minute historical rating threshold; they are computed and returned separately from the current state. Switching the historical range does not change the current rating. Raw probe evidence and manual decisions are not rewritten.
+
+DOGGO's `--do`, `--ad`, and authoritative queries are not by themselves sufficient to prove that a complete DNSSEC signing chain has been verified, so this version does not automatically create system-trusted DNS servers based on those flags.
+
+## Manual Refresh, Sorting, and CSV
+
+- The "Refresh" button at the top of the overview immediately schedules a new round of real probes for all enabled DNS servers, clears this round's trusted-reference cache, and shows progress; subject to the concurrency limit, servers already being probed get an extra round appended after the current one. Repeated clicks merge into the in-progress batch. Auto-refreshing the page only reads results and does not start extra probes.
+- Pausing during a refresh ends the refresh tracking and reports what was not completed. After resuming, you can refresh again.
+- The default sort is by current rating A, B, C, D, E, F, and reverse or manual sorting is also supported; pending assessment sorts after the letter ratings, and Unavailable always sorts last in every sort mode and direction.
+- "Export current results" at the top right of the overview table exports the monitoring summary for the current time range, filters, and sort order, including the selected range's performance metrics, current resolution quality and rating, rating window, rating samples, and the reason for waiting. "Export raw records" in server details provides per-probe evidence; the raw-records entry in the user guide exports all servers.
+- CSV import/export in the "Server list" area handles server configuration only, separate from monitoring results. The import dialog offers a UTF-8 CSV template with the fields `name,provider,address,enabled,trusted,notes`. Name and address are required, and the address determines the protocol.
+- Duplicates are checked by normalized DNS address, including default ports and supported equivalent DNS stamp forms. After previewing, choose skip/overwrite per row, or select skip-all/overwrite-all; duplicates within the CSV file are also shown. Different protocols, non-default ports, or DoH paths are still treated as different addresses.
+- Overwriting preserves the existing server ID and monitoring history; optional columns not supplied keep their original values, and explicitly supplied columns apply the imported values. New nodes default to enabled and untrusted. The import commits in one operation, and if the list changes after preview it requires a new preview, so it never partially writes.
+- Each import allows up to 1000 rows and 900 KiB; invalid rows must be corrected before committing. If the existing list has several nodes with the same address, resolve the ambiguity first. Exported text is escaped to prevent spreadsheet formula execution.
+
+The UI uses system fonts, following the size hierarchy, weight, contrast, and spacing principles of the [Apple Typography guidelines](https://developer.apple.com/design/human-interface-guidelines/typography), and adapts to browser zoom; it does not rely on external font downloads.
+
+## Windows Service
+
+The "Windows Service" page in the web UI and `manage-service.cmd` provide install, uninstall, start, stop, restart, and status queries. Management uses native Windows administrator authorization; installation neither auto-starts nor changes the firewall.
+
+The service is named `DNSMonitor`, set to delayed automatic start, and runs under the default Windows LocalSystem service account. To switch to running as a service, install it first, then normally exit the current portable process, and then start the service through `manage-service.cmd`, so the port and data files are not held by two instances. The same web UI is reachable while the service runs. Management results are written to `logs/service-action.log`.
+
+**Stop and uninstall the service before moving the directory, and reinstall it after moving**; the service registers absolute paths. Ordinary portable operation does not need the service.
+
+From an administrator terminal you can also use:
+
+```powershell
+.\dns-monitor.exe service install
+.\dns-monitor.exe service start
+.\dns-monitor.exe service status
+.\dns-monitor.exe service stop
+.\dns-monitor.exe service uninstall
+```
+
+Optional startup arguments must precede the subcommand, for example:
+
+```powershell
+.\dns-monitor.exe --listen 127.0.0.1:8088 --open
+.\dns-monitor.exe --data-dir D:\DNSData --doggo D:\Tools\doggo.exe service install
+```
+
+## Development and Building
+
+Go 1.25+, Windows amd64. Node.js and a C compiler are not required; SQLite uses a Go driver. A ready DOGGO is in `doggo`. The first build needs network access to download Go modules.
+
+```powershell
+.\build.ps1
+```
+
+The build script runs tests and `go vet`, produces the portable directory and ZIP, and collects third-party licenses. If the toolchain is not on PATH, you can place it in `.tools/go`. `.tools`, `data`, `logs`, and `dist` are all excluded from Git.
+
+Main code: `cmd/dns-monitor` for startup and lifecycle, `internal/httpapi` for the API and sessions, `internal/monitor` for probe scheduling, `internal/store` for storage and statistics, `internal/web` for the web UI, and `internal/winservice` for Windows SCM management.
+
+CPU and memory overhead vary with server count, interval, concurrency, and protocol. With the default concurrency of 2, only a bounded number of DOGGO child processes are launched at a time; chart queries aggregate history and are briefly cached, and logs roll with a size limit. Batch probe volume is roughly `server count x domain count x 86400 / interval seconds` per day, plus bounded trusted-source supplemental collection when no valid reference exists. Keeping raw evidence means disk usage grows with probe volume. To limit abnormal child-process output, each DOGGO run keeps at most 256 KiB each of stdout and stderr; over-limit runs are recorded as errors and are not used for pollution comparison.
+
+DOGGO is an independent bundled program; see `doggo/LICENSE` for its license, and the `licenses` folder in the distribution for other dependency licenses.
+
+## Resolution Quality and Rating History
+
+- The server list shows history swatches under the current resolution quality and current rating; clicking any swatch bar opens SERVER INSIGHTS.
+- Both the list and the details support 24 hours, 7 days, and 30 days, with one cell per 30 minutes, 3 hours, and 12 hours respectively. Each cell takes the worst recorded status within it, so brief anomalies are not hidden by averages; this does not mean the whole period was in that state.
+- The details show two aligned timelines at once. Hovering, keyboard-focusing, or clicking a cell reveals the probe counts for each status as well as the last snapshot in that cell: rating, observation window, sample count, query success rate, and average latency.
+- When a formal probe completes, the resolution quality, rating, and their metrics and thresholds at that moment are saved; auxiliary queries for trusted references do not produce rating snapshots. Later changes to rating configuration, trusted markers, or manual decisions do not rewrite saved snapshots, and new settings appear in the next formal probe snapshot.
+- Time cells with no snapshot before an upgrade, with probing stopped, or with no formal probe records show a gray hatched "no data" pattern and are not backfilled with the current rating. "Pending / pending assessment" and "Unavailable" have distinct colors.
+- History snapshots are retained for the last 30 days along with raw probes; deleting a server also deletes its snapshots. The history store is created automatically the first time you use the new version, with no manual migration.
