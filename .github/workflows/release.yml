@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.3.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows-amd64:
+    name: Build and publish portable package
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go build and module directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            .tools/gocache
+            .tools/gomodcache
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+') { throw "Release tag must look like v1.3.0, got '$tag'" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Test, vet and package
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Inspect package
+        id: package
+        shell: pwsh
+        run: |
+          $exe = 'dist\DNSMonitor\dns-monitor.exe'
+          $zip = 'dist\DNSMonitor-windows-amd64.zip'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'dns-monitor.exe is missing from the package' }
+          if (-not (Test-Path -LiteralPath $zip)) { throw 'Portable zip was not created' }
+          $app = (& $exe --version) -join ' '
+          $size = (Get-Item -LiteralPath $zip).Length
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "app=$app" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "size=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $summary = @(
+            $app
+            ('Package size: {0:N2} MiB' -f ($size / 1MB))
+            ('SHA256: {0}' -f $hash)
+          )
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DNSMonitor-windows-amd64
+          path: dist/DNSMonitor-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          APP: ${{ steps.package.outputs.app }}
+          SIZE: ${{ steps.package.outputs.size }}
+          HASH: ${{ steps.package.outputs.hash }}
+        run: |
+          $zip = 'dist\DNSMonitor-windows-amd64.zip'
+          $notes = @(
+            "Windows 10/11 与 Windows Server 2016 及以上 amd64 便携包，无需安装运行时。"
+            ""
+            "- 应用内版本：$env:APP"
+            "- 包大小：{0:N2} MiB" -f ($env:SIZE / 1MB)
+            "- 附件：DNSMonitor-windows-amd64.zip"
+            "- SHA256：$env:HASH"
+            ""
+            "解压后双击 start.cmd 启动，网页默认 http://127.0.0.1:8080。"
+            "升级前请退出旧程序并备份 data 目录；详见包内 使用说明.md 与 验收记录.md。"
+          )
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [IO.File]::WriteAllText($notesFile, ($notes -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+          $arguments = @($env:TAG, $zip, '--title', "DNS Monitor $env:TAG", '--notes-file', $notesFile, '--latest')
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $arguments += @('--target', $env:GITHUB_SHA) }
+          gh release create @arguments
