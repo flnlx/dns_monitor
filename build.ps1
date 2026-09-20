@@ -16,11 +16,11 @@ if (-not $SkipTests) {
   & $goExe vet ./...
   if ($LASTEXITCODE -ne 0) { throw 'Vet failed' }
 }
-New-Item -ItemType Directory -Force dist\DNSMonitor\doggo, dist\DNSMonitor\licenses | Out-Null
+New-Item -ItemType Directory -Force dist\DNSMonitor\licenses | Out-Null
 & $goExe build -trimpath -ldflags '-s -w' -o dist\DNSMonitor\dns-monitor.exe ./cmd/dns-monitor
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-Copy-Item -LiteralPath doggo\doggo.exe,doggo\LICENSE,doggo\README.md,doggo\DOGGOHELP.TXT -Destination dist\DNSMonitor\doggo -Force
 Copy-Item -LiteralPath README.md -Destination (Join-Path 'dist\DNSMonitor' $readmeFileName) -Force
+Copy-Item -LiteralPath LICENSE -Destination dist\DNSMonitor\LICENSE -Force
 Copy-Item -LiteralPath start.cmd,manage-service.cmd -Destination dist\DNSMonitor -Force
 if (Test-Path -LiteralPath VALIDATION.md) { Copy-Item -LiteralPath VALIDATION.md -Destination (Join-Path 'dist\DNSMonitor' $validationFileName) -Force }
 $moduleList = (& $goExe version -m dist\DNSMonitor\dns-monitor.exe) -join "`n"

@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -235,12 +235,9 @@ func TestPauseAndCancellation(t *testing.T) {
 
 // Real DOGGO integration uses a local UDP resolver and no external network.
 func TestDoggoLocalIntegration(t *testing.T) {
-	path, err := filepath.Abs(filepath.Join("..", "..", "doggo", "doggo.exe"))
+	path, err := exec.LookPath("doggo")
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = os.Stat(path); err != nil {
-		t.Skip("bundled doggo unavailable")
+		t.Skip("doggo not found in PATH")
 	}
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {

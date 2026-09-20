@@ -130,7 +130,20 @@ Optional startup arguments must precede the subcommand, for example:
 
 ## Development and Building
 
-Go 1.25+, Windows amd64. Node.js and a C compiler are not required; SQLite uses a Go driver. A ready DOGGO is in `doggo`. The first build needs network access to download Go modules.
+Go 1.25+, Windows amd64. Node.js and a C compiler are not required; SQLite uses a Go driver. The external tool DOGGO is required for DNS probing. The first build needs network access to download Go modules.
+
+### Installing DOGGO
+
+DOGGO is a standalone DNS client that must be installed separately:
+
+```powershell
+scoop install doggo
+# or
+go install github.com/mr-karan/doggo/cmd/doggo@latest
+# or download from https://github.com/mr-karan/doggo/releases
+```
+
+After installation, doggo must be on PATH, or specify its path with the `--doggo` flag at startup.
 
 ```powershell
 .\build.ps1
@@ -142,7 +155,7 @@ Main code: `cmd/dns-monitor` for startup and lifecycle, `internal/httpapi` for t
 
 CPU and memory overhead vary with server count, interval, concurrency, and protocol. With the default concurrency of 2, only a bounded number of DOGGO child processes are launched at a time; chart queries aggregate history and are briefly cached, and logs roll with a size limit. Batch probe volume is roughly `server count x domain count x 86400 / interval seconds` per day, plus bounded trusted-source supplemental collection when no valid reference exists. Keeping raw evidence means disk usage grows with probe volume. To limit abnormal child-process output, each DOGGO run keeps at most 256 KiB each of stdout and stderr; over-limit runs are recorded as errors and are not used for pollution comparison.
 
-DOGGO is an independent bundled program; see `doggo/LICENSE` for its license, and the `licenses` folder in the distribution for other dependency licenses.
+DOGGO is an external standalone program; see https://github.com/mr-karan/doggo for its license, and this project's `LICENSE` for the project license. Other dependency licenses are in the `licenses` folder in the distribution.
 
 ## Resolution Quality and Rating History
 

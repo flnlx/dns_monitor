@@ -137,7 +137,20 @@ DOGGO 的 `--do`、`--ad` 与权威查询不足以自行证明 DNSSEC 完整签�
 
 ## 开发与构建
 
-Go 1.25+，Windows amd64。无需 Node.js 或 C 编译器；SQLite 使用 Go 驱动。已有 DOGGO 位于 `doggo`。首次构建需要联网下载 Go 模块。
+Go 1.25+，Windows amd64。无需 Node.js 或 C 编译器；SQLite 使用 Go 驱动。需要外部程序 DOGGO 用于 DNS 探测。首次构建需要联网下载 Go 模块。
+
+### 安装 DOGGO
+
+DOGGO 是独立的 DNS 客户端工具，需自行安装：
+
+```powershell
+scoop install doggo
+# 或
+go install github.com/mr-karan/doggo/cmd/doggo@latest
+# 或从 https://github.com/mr-karan/doggo/releases 下载
+```
+
+安装后 doggo 应在 PATH 中，或启动时通过 `--doggo` 参数指定路径。
 
 ```powershell
 .\\build.ps1
@@ -149,7 +162,7 @@ Go 1.25+，Windows amd64。无需 Node.js 或 C 编译器；SQLite 使用 Go 驱
 
 CPU 和内存开销随服务器数量、周期、并发、协议变化。默认并发 2，每次只启动有界数量 DOGGO 子进程；图表查询聚合历史并短暂缓存，日志限量滚动。批量探测量约为 `服务器数 × 域名数 × 86400 / 周期秒数` 次/日，另加无有效参考时的有界可信源补采。原始证据保留意味着磁盘用量随探测量增长。为限制异常子进程输出，每次 DOGGO 的 stdout/stderr 各最多保留 256 KiB；超限记录错误，不用于污染比对。
 
-DOGGO 是随包独立程序，许可证见 `doggo/LICENSE`；其他依赖许可证见发行包 `licenses`。
+DOGGO 是独立外部程序，许可证见 https://github.com/mr-karan/doggo ；本项目许可证见 `LICENSE`。其他依赖许可证见发行包 `licenses`。
 
 ## 解析质量与评级历史
 
