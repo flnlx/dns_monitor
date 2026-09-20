@@ -86,7 +86,7 @@ func entry() error {
 	base := filepath.Dir(exe)
 	flags := flag.NewFlagSet("dns-monitor", flag.ContinueOnError)
 	dataDir := flags.String("data-dir", filepath.Join(base, "data"), "数据目录（默认程序旁 data）")
-	doggoPath := flags.String("doggo", "", "DOGGO 可执行文件路径（默认在 PATH 中查找）")
+	doggoPath := flags.String("doggo", "", "DOGGO 路径（默认先查同目录 doggo.exe，再查 PATH）")
 	listen := flags.String("listen", "", "覆盖监听地址（只影响本次启动）")
 	open := flags.Bool("open", false, "启动后打开本机网页")
 	delay := flags.Duration("helper-delay", 0, "服务辅助进程延迟")
@@ -103,10 +103,13 @@ func entry() error {
 		return e
 	}
 	if *doggoPath == "" {
-		if p, err := exec.LookPath("doggo"); err == nil {
+		localDoggo := filepath.Join(base, "doggo.exe")
+		if info, err := os.Stat(localDoggo); err == nil && !info.IsDir() {
+			*doggoPath = localDoggo
+		} else if p, err := exec.LookPath("doggo"); err == nil {
 			*doggoPath = p
 		} else {
-			return fmt.Errorf("找不到 doggo：未指定 --doggo 且 doggo 不在 PATH 中。\n请安装 doggo 后重试：\n  scoop install doggo\n  go install github.com/mr-karan/doggo/cmd/doggo@latest\n或从 https://github.com/mr-karan/doggo/releases 下载后使用 --doggo 指定路径")
+			return fmt.Errorf("找不到 doggo：未指定 --doggo，且程序目录和 PATH 中均无 doggo.exe。\n请将 doggo.exe 放在 dns-monitor.exe 同目录下，或安装到 PATH 后重试。\n安装方式：\n  scoop install doggo\n  go install github.com/mr-karan/doggo/cmd/doggo@latest\n或从 https://github.com/mr-karan/doggo/releases 下载")
 		}
 	}
 	*doggoPath, e = filepath.Abs(*doggoPath)

@@ -7,11 +7,12 @@ A locally run IPv4 DNS monitoring tool for Windows. Go backend, native web UI, S
 ## Starting and Moving
 
 1. Unzip `dist/DNSMonitor-windows-amd64.zip`, or open `dist/DNSMonitor`.
-2. Double-click `start.cmd`. The web UI defaults to `http://127.0.0.1:8080`, and the server listens on `0.0.0.0:8080` by default.
-3. The first run generates `data/access-key.txt`. Paste the key from that file into the login page; the same key is used for local and LAN access. Sessions live only in browser memory, so a refresh requires signing in again, and they expire after 12 hours.
-4. Add servers and providers; in the server form, tick the DNS servers you consider trusted; configure a domain, then start monitoring.
+2. Place `doggo.exe` next to `dns-monitor.exe` (see [Installing DOGGO](#installing-doggo)).
+3. Double-click `start.cmd`. The web UI defaults to `http://127.0.0.1:8080`, and the server listens on `0.0.0.0:8080` by default.
+4. The first run generates `data/access-key.txt`. Paste the key from that file into the login page; the same key is used for local and LAN access. Sessions live only in browser memory, so a refresh requires signing in again, and they expire after 12 hours.
+5. Add servers and providers; in the server form, tick the DNS servers you consider trusted; configure a domain, then start monitoring.
 
-Data and configuration are stored in `data/monitor.db`, with rolling logs under `logs`. After closing the program, copy the **entire folder** to migrate. Stop the program normally before backing up as well; while running, SQLite may also use `.db-wal` and `.db-shm`. Do not copy only the `.db` file that is in use.
+Data and configuration are stored in `data/monitor.db`, with rolling logs under `logs`. After closing the program, copy the **entire folder** to migrate (include `doggo.exe`). Stop the program normally before backing up as well; while running, SQLite may also use `.db-wal` and `.db-shm`. Do not copy only the `.db` file that is in use.
 
 Before upgrading, close the old program and back up `data`, then replace the program and bundled files and start it again. v1.2 upgrades the database automatically, and trusted history migrates together with the data directory; to roll back to an older version, use the data backup taken before the upgrade.
 
@@ -130,20 +131,24 @@ Optional startup arguments must precede the subcommand, for example:
 
 ## Development and Building
 
-Go 1.25+, Windows amd64. Node.js and a C compiler are not required; SQLite uses a Go driver. The external tool DOGGO is required for DNS probing. The first build needs network access to download Go modules.
+Go 1.24+, Windows amd64. Node.js and a C compiler are not required; SQLite uses a Go driver. The external tool DOGGO is required for DNS probing. The first build needs network access to download Go modules.
 
 ### Installing DOGGO
 
-DOGGO is a standalone DNS client that must be installed separately:
+DOGGO is a standalone DNS client that must be installed separately. Place `doggo.exe` next to `dns-monitor.exe`:
 
 ```powershell
+# Option 1: Download and place in program directory
+# Download windows-amd64 from https://github.com/mr-karan/doggo/releases,
+# extract and put doggo.exe next to dns-monitor.exe
+
+# Option 2: Install to PATH
 scoop install doggo
 # or
 go install github.com/mr-karan/doggo/cmd/doggo@latest
-# or download from https://github.com/mr-karan/doggo/releases
 ```
 
-After installation, doggo must be on PATH, or specify its path with the `--doggo` flag at startup.
+At startup, doggo is located in this order: ① `--doggo` flag → ② `doggo.exe` next to the executable → ③ PATH. If not found, installation instructions are shown.
 
 ```powershell
 .\build.ps1

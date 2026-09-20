@@ -14,11 +14,12 @@
 ## 启动与移动
 
 1. 解压 `dist/DNSMonitor-windows-amd64.zip`，或进入 `dist/DNSMonitor`。
-2. 双击 `start.cmd`。网页默认地址 `http://127.0.0.1:8080`，默认监听 `0.0.0.0:8080`。
-3. 首次运行会生成 `data/access-key.txt`。将里面的密钥粘贴至登录页；同一密钥用于本机和局域网访问。会话仅保存在浏览器内存中，刷新后重新登录，12 小时过期。
-4. 添加服务器与供应商；在服务器表单勾选你认可的可信 DNS；配置域名后开始监测。
+2. 将 `doggo.exe` 放在 `dns-monitor.exe` 同目录下（见[安装 DOGGO](#安装-doggo)）。
+3. 双击 `start.cmd`。网页默认地址 `http://127.0.0.1:8080`，默认监听 `0.0.0.0:8080`。
+4. 首次运行会生成 `data/access-key.txt`。将里面的密钥粘贴至登录页；同一密钥用于本机和局域网访问。会话仅保存在浏览器内存中，刷新后重新登录，12 小时过期。
+5. 添加服务器与供应商；在服务器表单勾选你认可的可信 DNS；配置域名后开始监测。
 
-数据与配置保存在 `data/monitor.db`，滚动日志在 `logs`。退出程序后复制**整个文件夹**即可迁移。备份前也应先正常停止；运行期间 SQLite 可能同时使用 `.db-wal`、`.db-shm`。不要只复制正在使用的 `.db`。
+数据与配置保存在 `data/monitor.db`，滚动日志在 `logs`。退出程序后复制**整个文件夹**即可迁移（需包含 `doggo.exe`）。备份前也应先正常停止；运行期间 SQLite 可能同时使用 `.db-wal`、`.db-shm`。不要只复制正在使用的 `.db`。
 
 升级前退出旧程序并备份 `data`，替换程序和随包文件后启动。v1.2 会自动升级数据库，可信历史随数据目录一起迁移；需要回退旧版时使用升级前的数据备份。
 
@@ -137,20 +138,23 @@ DOGGO 的 `--do`、`--ad` 与权威查询不足以自行证明 DNSSEC 完整签�
 
 ## 开发与构建
 
-Go 1.25+，Windows amd64。无需 Node.js 或 C 编译器；SQLite 使用 Go 驱动。需要外部程序 DOGGO 用于 DNS 探测。首次构建需要联网下载 Go 模块。
+Go 1.24+，Windows amd64。无需 Node.js 或 C 编译器；SQLite 使用 Go 驱动。需要外部程序 DOGGO 用于 DNS 探测。首次构建需要联网下载 Go 模块。
 
 ### 安装 DOGGO
 
-DOGGO 是独立的 DNS 客户端工具，需自行安装：
+DOGGO 是独立的 DNS 客户端工具，需自行安装。推荐将 `doggo.exe` 放在 `dns-monitor.exe` 同目录下：
 
 ```powershell
+# 方法一：下载后放入程序目录
+# 从 https://github.com/mr-karan/doggo/releases 下载 windows-amd64 版本，解压后将 doggo.exe 放在 dns-monitor.exe 旁
+
+# 方法二：安装到 PATH
 scoop install doggo
 # 或
 go install github.com/mr-karan/doggo/cmd/doggo@latest
-# 或从 https://github.com/mr-karan/doggo/releases 下载
 ```
 
-安装后 doggo 应在 PATH 中，或启动时通过 `--doggo` 参数指定路径。
+程序启动时按以下顺序查找 doggo：① `--doggo` 参数指定路径 → ② 程序同目录 `doggo.exe` → ③ PATH 环境变量。均未找到时给出安装指引。
 
 ```powershell
 .\\build.ps1
