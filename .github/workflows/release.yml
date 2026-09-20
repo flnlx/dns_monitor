@@ -104,8 +104,13 @@ jobs:
             "- 附件：DNSMonitor-windows-amd64.zip"
             "- SHA256：$env:HASH"
             ""
-            "解压后双击 start.cmd 启动，网页默认 http://127.0.0.1:8080。"
-            "升级前请退出旧程序并备份 data 目录；详见包内 使用说明.md 与 验收记录.md。"
+            "### 变更"
+            "- **移除捆绑 doggo**：doggo.exe 不再随包分发，需自行放置在 dns-monitor.exe 同目录或安装到 PATH"
+            "- 启动时自动查找同目录 doggo.exe，未找到时提示安装方式"
+            "- 项目新增 GPL v3 许可证文件"
+            ""
+            "解压后将 doggo.exe 放在 dns-monitor.exe 旁，双击 start.cmd 启动，网页默认 http://127.0.0.1:8080。"
+            "升级前请退出旧程序并备份 data 目录；详见包内 使用说明.md。"
           )
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           [IO.File]::WriteAllText($notesFile, ($notes -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
