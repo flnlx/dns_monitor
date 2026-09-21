@@ -389,9 +389,11 @@ func (s *Server) service(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e := winservice.Request(action, s.Exe, s.DataDir, s.DoggoPath); e != nil {
+		log.Printf("网页请求服务操作失败: action=%s error=%v", action, e)
 		problem(w, 400, e)
 		return
 	}
+	log.Printf("网页请求服务操作: %s", action)
 	jsonOut(w, 202, map[string]any{"ok": true, "message": "已提交服务操作；如有 Windows 管理员授权提示请确认。操作结果见 logs/service-action.log，随后刷新状态。"})
 }
 func csvSafe(v string) string {

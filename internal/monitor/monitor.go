@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"sort"
 	"strings"
@@ -123,6 +124,7 @@ func (m *Monitor) Run(ctx context.Context) {
 		m.setError(err)
 	}
 	var servers []model.Server
+	var serverByID map[int64]model.Server
 	var cfg model.Config
 	var pruneAt int64
 	var workers sync.WaitGroup
@@ -202,6 +204,10 @@ func (m *Monitor) Run(ctx context.Context) {
 		}
 		cfg = c
 		servers = ss
+		serverByID = make(map[int64]model.Server, len(ss))
+		for i := range ss {
+			serverByID[ss[i].ID] = ss[i]
+		}
 	}
 	refresh()
 	dispatch := func() {
@@ -268,6 +274,14 @@ func (m *Monitor) Run(ctx context.Context) {
 			delete(m.inFlight, completed.serverID)
 			m.completeBatchLocked(completed)
 			m.mu.Unlock()
+			previous := failures[completed.serverID]
+			if complete, ok := serverByID[completed.serverID]; ok {
+				if previous == 0 && completed.failures > 0 {
+					log.Printf("服务器探测失败，进入退避: id=%d name=%s address=%s failures=%d", complete.ID, complete.Name, complete.Address, completed.failures)
+				} else if previous > 0 && completed.failures == 0 {
+					log.Printf("服务器恢复可用: id=%d name=%s address=%s", complete.ID, complete.Name, complete.Address)
+				}
+			}
 			nextDue[completed.serverID] = completed.nextDue
 			failures[completed.serverID] = completed.failures
 			dispatch()

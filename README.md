@@ -115,7 +115,7 @@ DOGGO 的 `--do`、`--ad` 与权威查询不足以自行证明 DNSSEC 完整签�
 
 网页“Windows 服务”页与 `manage-service.cmd` 提供安装、卸载、启动、停止、重启、状态查询。管理时使用 Windows 原生管理员授权，安装不会自动启动，也不会自动改动防火墙。
 
-服务名 `DNSMonitor`，延迟自动启动，使用 Windows 默认 LocalSystem 服务账户。要切换到服务运行，请先安装，然后正常退出当前便携进程，再通过 `manage-service.cmd` 启动服务，避免端口和数据文件被两个实例占用。服务运行时也可以访问相同网页。管理结果写入 `logs/service-action.log`。
+服务名 `DNSMonitor`，延迟自动启动，使用 Windows 默认 LocalSystem 服务账户。要切换到服务运行，请先安装，然后正常退出当前便携进程，再通过 `manage-service.cmd` 启动服务，避免端口和数据文件被两个实例占用。服务运行时也可以访问相同网页。管理结果写入 `logs/service-action.log`。**安装只注册服务、不会自动启动**：安装后想立即生效请用菜单 2 或 `service start`，否则要等下次开机才会自动启动。判断操作是否生效：运行 `dns-monitor.exe service status` 查看 `installed`/`state`，或查看 `logs/service-action.log` 最后一行 `result=`。
 
 **移动目录前先停止并卸载服务，移动后重新安装**；服务注册了绝对路径。普通便携运行不需要服务。
 

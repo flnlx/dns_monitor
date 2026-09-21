@@ -68,6 +68,24 @@ func (r *rotatingLog) Write(b []byte) (int, error) {
 }
 func (r *rotatingLog) Close() error { r.mu.Lock(); defer r.mu.Unlock(); return r.file.Close() }
 
+// locateDoggo returns the DOGGO executable: the explicit --doggo path when given,
+// otherwise doggo.exe beside the binary or on PATH. It does not touch the filesystem
+// unless a path search is required, so service control ("service status") never
+// depends on a reachable DOGGO.
+func locateDoggo(explicit, base string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	local := filepath.Join(base, "doggo.exe")
+	if info, err := os.Stat(local); err == nil && !info.IsDir() {
+		return local, nil
+	}
+	if p, err := exec.LookPath("doggo"); err == nil {
+		return p, nil
+	}
+	return "", errors.New("找不到 doggo：未指定 --doggo，且程序目录和 PATH 中均无 doggo.exe。\n请将 doggo.exe 放在 dns-monitor.exe 同目录下，或安装到 PATH 后重试。\n安装方式：\n  scoop install doggo\n  go install github.com/mr-karan/doggo/cmd/doggo@latest\n或从 https://github.com/mr-karan/doggo/releases 下载")
+}
+
 func main() {
 	if e := entry(); e != nil {
 		fmt.Fprintln(os.Stderr, "DNS Monitor:", e)
@@ -102,20 +120,6 @@ func entry() error {
 	if e != nil {
 		return e
 	}
-	if *doggoPath == "" {
-		localDoggo := filepath.Join(base, "doggo.exe")
-		if info, err := os.Stat(localDoggo); err == nil && !info.IsDir() {
-			*doggoPath = localDoggo
-		} else if p, err := exec.LookPath("doggo"); err == nil {
-			*doggoPath = p
-		} else {
-			return fmt.Errorf("找不到 doggo：未指定 --doggo，且程序目录和 PATH 中均无 doggo.exe。\n请将 doggo.exe 放在 dns-monitor.exe 同目录下，或安装到 PATH 后重试。\n安装方式：\n  scoop install doggo\n  go install github.com/mr-karan/doggo/cmd/doggo@latest\n或从 https://github.com/mr-karan/doggo/releases 下载")
-		}
-	}
-	*doggoPath, e = filepath.Abs(*doggoPath)
-	if e != nil {
-		return e
-	}
 	args := flags.Args()
 	if len(args) > 0 && args[0] == "service" {
 		if len(args) != 2 {
@@ -137,7 +141,17 @@ func entry() error {
 			}
 			time.Sleep(*delay)
 		}
-		err := winservice.Manage(args[1], exe, *dataDir, *doggoPath)
+		doggoService := *doggoPath
+		var err error
+		if args[1] == "install" {
+			doggoService, err = locateDoggo(*doggoPath, base)
+			if err == nil {
+				doggoService, err = filepath.Abs(doggoService)
+			}
+		}
+		if err == nil {
+			err = winservice.Manage(args[1], exe, *dataDir, doggoService)
+		}
 		fmt.Fprintf(logger, "%s action=%s result=%v\n", time.Now().Format(time.RFC3339), args[1], err)
 		if err == nil {
 			fmt.Println("服务操作完成:", args[1])
@@ -146,6 +160,14 @@ func entry() error {
 	}
 	if len(args) > 0 && args[0] != "service-run" {
 		return fmt.Errorf("未知命令: %s", args[0])
+	}
+	doggo, e := locateDoggo(*doggoPath, base)
+	if e != nil {
+		return e
+	}
+	*doggoPath, e = filepath.Abs(doggo)
+	if e != nil {
+		return e
 	}
 	isService := winservice.IsService()
 	run := func(ctx context.Context) error {
@@ -170,6 +192,9 @@ func runApp(ctx context.Context, exe, dataDir, doggoPath, listenOverride string,
 	defer logger.Close()
 	log.SetOutput(io.MultiWriter(os.Stdout, logger))
 	log.SetFlags(log.LstdFlags)
+	if winservice.IsService() {
+		log.Print("以 Windows 服务方式运行")
+	}
 	defer func() {
 		if runErr != nil {
 			log.Printf("程序运行失败: %v", runErr)

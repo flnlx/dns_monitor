@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -168,6 +169,7 @@ func Request(action, exe, dataDir, doggoPath string) error {
 type handler struct{ run func(context.Context) error }
 
 func (h handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+	log.Print("Windows 服务：控制循环启动")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	status <- svc.Status{State: svc.StartPending}
@@ -179,6 +181,7 @@ func (h handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status c
 		select {
 		case err := <-done:
 			if err != nil {
+				log.Printf("Windows 服务：运行函数退出，错误=%v", err)
 				return true, 1
 			}
 			return false, 0
@@ -187,6 +190,7 @@ func (h handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status c
 			case svc.Interrogate:
 				status <- current
 			case svc.Stop, svc.Shutdown:
+				log.Print("Windows 服务：收到停止/关机请求，正在停止")
 				status <- svc.Status{State: svc.StopPending}
 				cancel()
 				select {
