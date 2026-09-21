@@ -19,8 +19,14 @@ func TestRatingConfigPersistenceAndLegacyClients(t *testing.T) {
 	if cfg.RatingWindowMinutes != 60 || cfg.RatingMinSamples != 3 || cfg.RatingMinCoverageMinutes != 5 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.RatingWAvail != .35 || cfg.RatingWSuccess != .30 || cfg.RatingWLatency != .35 {
+		t.Fatalf("unexpected weight defaults: %+v", cfg)
+	}
 	cfg.RatingWindowMinutes = 90
 	cfg.RatingMinSamples = 5
+	cfg.RatingWAvail = .40
+	cfg.RatingWSuccess = .30
+	cfg.RatingWLatency = .30
 	for _, coverage := range []int{30, 0} {
 		cfg.RatingMinCoverageMinutes = coverage
 		body, _ := json.Marshal(cfg)
@@ -35,6 +41,9 @@ func TestRatingConfigPersistenceAndLegacyClients(t *testing.T) {
 		delete(legacy, "rating_window_minutes")
 		delete(legacy, "rating_min_samples")
 		delete(legacy, "rating_min_coverage_minutes")
+		delete(legacy, "rating_weight_availability")
+		delete(legacy, "rating_weight_success_rate")
+		delete(legacy, "rating_weight_latency")
 		legacy["interval_seconds"] = 120
 		body, _ = json.Marshal(legacy)
 		response = call(h, "PUT", "/api/config", string(body), token)
@@ -44,6 +53,9 @@ func TestRatingConfigPersistenceAndLegacyClients(t *testing.T) {
 		saved, err := s.Store.GetConfig()
 		if err != nil || saved.RatingWindowMinutes != 90 || saved.RatingMinSamples != 5 || saved.RatingMinCoverageMinutes != coverage || saved.IntervalSeconds != 120 {
 			t.Fatalf("legacy update lost new settings: %+v, %v", saved, err)
+		}
+		if saved.RatingWAvail != .40 || saved.RatingWSuccess != .30 || saved.RatingWLatency != .30 {
+			t.Fatalf("legacy update lost rating weights: %+v", saved)
 		}
 	}
 }
@@ -69,6 +81,11 @@ func TestRatingConfigRejectsInvalidUpdates(t *testing.T) {
 		{"fractional samples", "rating_min_samples", 3.5},
 		{"fractional coverage", "rating_min_coverage_minutes", 0.5},
 		{"string value", "rating_min_samples", "3"},
+		{"weights below one", "rating_weight_availability", 0.1},
+		{"weights above one", "rating_weight_availability", 0.6},
+		{"negative weight", "rating_weight_latency", -0.1},
+		{"weight above one", "rating_weight_success_rate", 1.1},
+		{"weight string", "rating_weight_latency", "0.5"},
 	} {
 		t.Run(item.name, func(t *testing.T) {
 			var body map[string]any
@@ -153,7 +170,7 @@ func TestHistoryAndSummaryExposeCurrentEvaluation(t *testing.T) {
 	if len(state.Servers) != 1 || len(state.Servers[0].StatusHistory) != 60 {
 		t.Fatal("state missing compact status history")
 	}
-	if state.Version != "1.5.0" || len(state.Servers) != 1 || state.Servers[0].Metrics.Grade != "F" || state.Servers[0].Current.Grade != "A" {
+	if state.Version != "1.6.0" || len(state.Servers) != 1 || state.Servers[0].Metrics.Grade != "F" || state.Servers[0].Current.Grade != "A" {
 		t.Fatalf("state contract lost current or historical evaluation: %+v", state)
 	}
 }

@@ -10,11 +10,11 @@ var ErrTrustedOverride = errors.New("可信 DNS 不允许手动定罪；请先�
 
 // Trust is a current user policy, separate from immutable historical probe evidence.
 // Apply it before scoring so removing an old F grade restores the computed quality score.
-func (a *accumulator) finishForServer(window int64, trusted bool) model.Metrics {
+func (a *accumulator) finishForServer(window int64, trusted bool, w ratingWeights) model.Metrics {
 	if trusted {
 		copy := *a
 		copy.pollution = 1
-		return copy.finish(window)
+		return copy.finish(window, w)
 	}
-	return a.finish(window)
+	return a.finish(window, w)
 }

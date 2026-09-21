@@ -14,6 +14,9 @@ type Config struct {
 	RatingWindowMinutes      int      `json:"rating_window_minutes"`
 	RatingMinSamples         int      `json:"rating_min_samples"`
 	RatingMinCoverageMinutes int      `json:"rating_min_coverage_minutes"`
+	RatingWAvail             float64  `json:"rating_weight_availability"`
+	RatingWSuccess           float64  `json:"rating_weight_success_rate"`
+	RatingWLatency           float64  `json:"rating_weight_latency"`
 	Domains                  []Domain `json:"domains"`
 }
 type Domain struct {
@@ -22,7 +25,7 @@ type Domain struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, ReferenceHistoryHours: 1, RatingWindowMinutes: 60, RatingMinSamples: 3, RatingMinCoverageMinutes: 5, Domains: []Domain{{Name: "www.youtube.com", Type: "A"}}}
+	return Config{Listen: "0.0.0.0:8080", IntervalSeconds: 300, TimeoutSeconds: 3, Concurrency: 2, SmartBackoff: true, MaxBackoffHours: 1, ReferenceTTLSeconds: 300, ReferenceHistoryHours: 1, RatingWindowMinutes: 60, RatingMinSamples: 3, RatingMinCoverageMinutes: 5, RatingWAvail: .35, RatingWSuccess: .30, RatingWLatency: .35, Domains: []Domain{{Name: "www.youtube.com", Type: "A"}}}
 }
 
 type Server struct {

@@ -27,7 +27,7 @@ import (
 	"dnsmonitor/internal/winservice"
 )
 
-const Version = "1.5.0"
+const Version = "1.6.0"
 
 type session struct{ expires time.Time }
 type Server struct {
@@ -327,6 +327,9 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 		RatingWindowMinutes:      prior.RatingWindowMinutes,
 		RatingMinSamples:         prior.RatingMinSamples,
 		RatingMinCoverageMinutes: prior.RatingMinCoverageMinutes,
+		RatingWAvail:             prior.RatingWAvail,
+		RatingWSuccess:           prior.RatingWSuccess,
+		RatingWLatency:           prior.RatingWLatency,
 	}
 	if e := decode(w, r, &cfg); e != nil {
 		problem(w, 400, e)

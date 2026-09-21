@@ -134,6 +134,11 @@
       'cfg.samplesHelp': 'Default 3 formal samples; auxiliary trusted queries do not count.',
       'cfg.coverageLabel': 'Minimum rating coverage',
       'cfg.coverageHelp': 'Default 5 minutes; 0 adds no extra coverage wait and cannot exceed the observation window.',
+      'cfg.weightAvailLabel': 'Availability weight',
+      'cfg.weightSuccessLabel': 'Success rate weight',
+      'cfg.weightLatencyLabel': 'P95 latency weight',
+      'cfg.weightHelp': 'Weights must add up to 100%, default 35/30/35. Composite score = availability × weight + success rate × weight + latency score × weight.',
+      'cfg.weightSumHelp': 'Each weight is 0–100 and the three must add up to 100%.',
       'cfg.ratingHelp': 'Current resolution quality updates with the latest formal round in the window; without recent samples a new probe is awaited. With insufficient trusted references or answers the state shows pending and never falls back to an old clean rating; hover to see the pending reason. With a single domain and a 5-minute cycle a rating usually forms in about 10 minutes.',
       'cfg.domainsTitle': 'Probe domains',
       'cfg.domainsSub': 'Each probe round queries all of the domains below.',
@@ -157,6 +162,7 @@
       'unit.hours': 'hours',
       'unit.samples': 'samples',
       'unit.count': 'servers',
+      'unit.percent': '%',
       // --- service page ---
       'svc.title': 'Run as a Windows service',
       'svc.sub': 'Keep monitoring running after you close the browser or sign out.',
@@ -195,8 +201,8 @@
       'metric.coverageDesc': 'How well the selected time range is sampled; don’t rush ratings while monitoring is sparse.',
       'guide.g4Title': 'Ratings & data retention',
       'guide.g4P1': 'The overview’s current resolution quality comes from the latest formal round in the recent window; without samples in the window, or when the latest result is pending, an old clean state is not kept. If every query in the latest formal round fails, the current rating immediately shows “Unavailable” — trusted DNS included — and sorts to the bottom in every direction; ratings return to normal rules once a round has successes. A window without samples still shows “Pending”. The current rating uses a configurable recent window (default 60 minutes) and scores after 3 formal samples and 5 minutes of valid coverage.',
-      'guide.g4P2': 'The quality score weighs availability (45%), query success rate (35%), and P95 latency (20%). A ≥ 95, B ≥ 85, C ≥ 70, D &lt; 70; matches or clean state follow that performance score, suspicious rates E, and suspected or manually confirmed pollution rates F first.',
-      'guide.g4P3': 'P95 latency ≤ 50 ms earns the full latency share, ≥ 2000 ms earns zero, decreasing linearly in between. With too few samples, insufficient coverage, or insufficient resolution evidence the state shows “Pending”; hover for the reason and progress. Detail metrics and charts keep the selected historical range; probes that backoff skipped are never faked as successes.',
+      'guide.g4P2': 'The quality score weighs availability (35%), query success rate (30%), and P95 latency (35%). A ≥ 95, B ≥ 85, C ≥ 70, D &lt; 70; matches or clean state follow that performance score, suspicious rates E, and suspected or manually confirmed pollution rates F first.',
+      'guide.g4P3': 'P95 latency ≤ 200 ms earns the full latency share, ≥ 2000 ms earns zero, decreasing linearly in between. With too few samples, insufficient coverage, or insufficient resolution evidence the state shows “Pending”; hover for the reason and progress. Detail metrics and charts keep the selected historical range; probes that backoff skipped are never faked as successes.',
       'guide.g4P4': 'Raw records from every actual probe roll over after 30 days and are deleted automatically. Charts are time-aggregated. “Export current results” in the overview keeps the current range, filters, and sorting; the entry below exports raw records for all servers in the selected range.',
       'guide.exportAll': 'Export all raw records ↗',
       'guide.portableTitle': 'The whole folder is your workspace.',
@@ -294,6 +300,7 @@
       'grade.B': 'Good: overall score ≥ 85 and < 95, from availability, query success rate, and P95 latency.',
       'grade.C': 'Fair: overall score ≥ 70 and < 85, from availability, query success rate, and P95 latency.',
       'grade.D': 'Poor: overall score < 70, from availability, query success rate, and P95 latency.',
+      'grade.breakdown': 'Score: {avail} availability, {succ} success, and {lat} latency points from a {p95} ms P95 → {score} overall.',
       'grade.E': 'Resolution results are suspicious, rating E takes priority; unseen IPs match the trusted reference on the first two octets.',
       'grade.F': 'Suspected or manually confirmed pollution; rating F takes priority.',
       'grade.unavailable': 'Unavailable: every query in the latest formal round failed (connectivity failure, timeout, or resolution error); trusted marks do not exempt. Ratings resume after recovery.',
@@ -394,6 +401,7 @@
       'config.integer': 'Enter an integer within {range}.',
       'config.decimal': 'Enter a value within {range}, with at most 1 decimal.',
       'config.coverage': 'Minimum coverage cannot exceed the rating window ({window} min).',
+      'config.weightSum': 'The three rating weights must add up to 100%.',
       'server.editTitle': 'Edit DNS server',
       'server.addTitle': 'Add DNS server',
       'server.updatedToast': 'Server config updated',
@@ -690,12 +698,23 @@
     unavailable: () => t('grade.unavailable') ?? '不可用：最新一轮正式探测全部查询失败（连接失败、超时或解析错误）；可信标记不豁免。恢复成功后重新评级。',
     pending: () => t('grade.pending') ?? '等待足够的正式采样与有效覆盖；评级门槛可在探测配置中调整。'
   };
+  const latencyScoreOf = metrics => hasLatency(metrics) ? Math.max(0, Math.min(100, 100 * (2000 - metrics.p95_ms) / 1800)) : null;
+  const scoreBreakdown = evaluation => {
+    const avail = percent(evaluation.availability, evaluation, true);
+    const succ = percent(evaluation.success_rate, evaluation);
+    const p95 = hasLatency(evaluation) ? integer(evaluation.p95_ms) : '—';
+    const lat = latencyScoreOf(evaluation);
+    const latText = lat === null ? '—' : number(lat);
+    const text = t('grade.breakdown', { avail, succ, p95, lat: latText, score: number(evaluation.score) });
+    return ' ' + (text ?? `评分：可用率 ${avail} · 成功率 ${succ} · P95 ${p95}ms（时延分 ${latText}）→ 综合 ${number(evaluation.score)}。`);
+  };
   const gradeHint = (value, evaluation = {}) => {
     const description = gradeHints[value] ? gradeHints[value]() : gradeHints.pending();
     if (!evaluation.window_minutes) return description;
     const windowMin = integer(evaluation.window_minutes);
     const prefix = t('grade.windowPrefix', { minutes: windowMin }) ?? `最近 ${windowMin} 分钟。`;
-    if (value !== 'pending' && gradeHints[value]) return prefix + description;
+    const breakdown = value !== 'unavailable' && hasSamples(evaluation) ? scoreBreakdown(evaluation) : '';
+    if (value !== 'pending' && gradeHints[value]) return prefix + description + breakdown;
     const pendingReasons = {
       no_samples: () => t('grade.noSamples') ?? '评级窗口内没有正式采样，等待下一轮探测。',
       quality_unknown: () => t('grade.qualityUnknown') ?? '最新正式探测的解析质量待判定，可查看域名记录中的原因。',
@@ -704,8 +723,8 @@
     };
     const reason = pendingReasons[evaluation.pending_reason] ? pendingReasons[evaluation.pending_reason]() : description;
     const covered = Math.floor((evaluation.covered_minutes || 0) * 10) / 10;
-    const summary = t('grade.pendingSummary', { reason, samples: integer(evaluation.samples || 0), minSamples: integer(evaluation.min_samples), coverage: number(covered), minCoverage: integer(evaluation.min_coverage_minutes) });
-    return prefix + summary;
+    const summary = t('grade.pendingSummary', { reason, samples: integer(evaluation.samples || 0), minSamples: integer(evaluation.min_samples), coverage: number(covered), minCoverage: integer(evaluation.min_coverage_minutes) }) ?? `${reason}；采样 ${integer(evaluation.samples || 0)}/${integer(evaluation.min_samples)} 次，覆盖 ${number(covered)}/${integer(evaluation.min_coverage_minutes)} 分钟。`;
+    return prefix + summary + breakdown;
   };
   const gradeHTML = (value, evaluation) => value === 'unavailable' ? `<span class="grade grade-unavailable" title="${escape(gradeHint(value, evaluation))}">${t('state.unavailable') ?? '不可用'}</span>` : ['A', 'B', 'C', 'D', 'E', 'F'].includes(value) ? `<span class="grade grade-${value.toLowerCase()}" title="${escape(gradeHint(value, evaluation))}">${value}</span>` : `<span class="grade grade-pending" title="${escape(gradeHint('pending', evaluation))}">${t('state.pending') ?? '待评估'}</span>`;
 
@@ -1150,7 +1169,7 @@
     $$('.sort-button').forEach(button => {
       const active = button.dataset.sort === state.sort;
       button.classList.toggle('active', active);
-      $('span', button).textContent = active ? (state.descending ? '↓' : '↑') : '↕';
+      $('.sort-arrow', button).textContent = active ? (state.descending ? '↓' : '↑') : '↕';
       button.closest('th').setAttribute('aria-sort', active ? state.descending ? 'descending' : 'ascending' : 'none');
     });
   }
@@ -1242,7 +1261,8 @@
     return row;
   }
 
-  function validateConfigNumber(input, showEmpty = false) {
+  const ratingWeightFields = ['rating_weight_availability', 'rating_weight_success_rate', 'rating_weight_latency'];
+  function validateConfigNumber(input, showEmpty = false, cascade = true) {
     input.setCustomValidity('');
     const range = `${input.min}–${input.max} ${unitLabel(input.dataset.unit)}`;
     const validity = input.validity;
@@ -1254,6 +1274,10 @@
       const window = $('#config-form').elements.rating_window_minutes;
       if (window.value !== '' && window.validity.valid && input.valueAsNumber > window.valueAsNumber) message = t('config.coverage', { window: window.value }) ?? `最小覆盖不能超过评级观察窗口（${window.value} 分钟）。`;
     }
+    if (!message && ratingWeightFields.includes(input.name)) {
+      const sum = ratingWeightFields.reduce((total, name) => total + ($('#config-form').elements[name].value === '' ? 0 : Number($('#config-form').elements[name].value || 0)), 0);
+      if (sum !== 100) message = t('config.weightSum') ?? '三项评级权重之和必须为 100%。';
+    }
     const visible = !!message && (showEmpty || input.value !== '' || validity.badInput);
     input.setCustomValidity(message);
     input.setAttribute('aria-invalid', String(visible));
@@ -1262,6 +1286,7 @@
     hint.textContent = visible ? message : '';
     hint.hidden = !visible;
     if (input.name === 'rating_window_minutes') validateConfigNumber($('#config-form').elements.rating_min_coverage_minutes);
+    if (cascade && ratingWeightFields.includes(input.name)) ratingWeightFields.forEach(name => { if (name !== input.name) validateConfigNumber($('#config-form').elements[name], showEmpty, false); });
     return !message;
   }
 
@@ -1270,6 +1295,7 @@
     const form = $('#config-form');
     const config = state.data.config;
     ['listen', 'interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours', 'rating_window_minutes', 'rating_min_samples', 'rating_min_coverage_minutes'].forEach(field => { form.elements[field].value = config[field] ?? ''; });
+    ratingWeightFields.forEach(field => { const value = config[field]; form.elements[field].value = value == null ? '' : Math.round(value * 100); });
     $$('#config-form input[type=number]').forEach(input => validateConfigNumber(input));
     form.elements.smart_backoff.checked = config.smart_backoff;
     $('#domain-rows').replaceChildren(...(config.domains || []).map(domainRow));
@@ -1293,6 +1319,7 @@
     if (!form.reportValidity()) return;
     const body = { listen: form.elements.listen.value.trim(), smart_backoff: form.elements.smart_backoff.checked, domains: $$('.domain-row').map(row => ({ name: $('.domain-name', row).value.trim(), type: $('.domain-type-select', row).value })) };
     ['interval_seconds', 'timeout_seconds', 'concurrency', 'max_backoff_hours', 'reference_ttl_seconds', 'reference_history_hours', 'rating_window_minutes', 'rating_min_samples', 'rating_min_coverage_minutes'].forEach(field => { body[field] = Number(form.elements[field].value); });
+    ratingWeightFields.forEach(field => { body[field] = Number(form.elements[field].value) / 100; });
     const button = $('#save-config-button');
     button.disabled = true;
     setError('#config-error', '');

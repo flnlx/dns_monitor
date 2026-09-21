@@ -5,7 +5,7 @@ $readmeFileName = (-join [char[]](0x4F7F, 0x7528, 0x8BF4, 0x660E)) + '.md'
 $validationFileName = (-join [char[]](0x9A8C, 0x6536, 0x8BB0, 0x5F55)) + '.md'
 Set-Location -LiteralPath $PSScriptRoot
 $goCmd = Get-Command go -ErrorAction SilentlyContinue
-$goExe = if ($goCmd) { $goCmd.Source } else { Join-Path $PSScriptRoot '.tools\go\bin\go.exe' }
+$goExe = if ($goCmd) { $goCmd.Source } elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.tools\go\bin\go.exe')) { Join-Path $PSScriptRoot '.tools\go\bin\go.exe' } else { Join-Path $PSScriptRoot '.tools\go\go\bin\go.exe' }
 if (-not (Test-Path -LiteralPath $goExe)) { throw 'Install Go 1.25 or later, or unpack it at .tools\go.' }
 $env:GOCACHE = Join-Path $PSScriptRoot '.tools\gocache'
 $env:GOMODCACHE = Join-Path $PSScriptRoot '.tools\gomodcache'

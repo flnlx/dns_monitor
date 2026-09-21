@@ -676,11 +676,17 @@ type accumulator struct {
 	buckets                        map[int64]int64
 }
 
-func (a *accumulator) finish(window int64) model.Metrics {
-	return a.finishWithThresholds(window, 10, 30*60*1000)
+type ratingWeights struct{ availability, successRate, latency float64 }
+
+func configRatingWeights(c model.Config) ratingWeights {
+	return ratingWeights{availability: c.RatingWAvail, successRate: c.RatingWSuccess, latency: c.RatingWLatency}
 }
 
-func (a *accumulator) finishWithThresholds(window, minSamples, minCoverageMS int64) model.Metrics {
+func (a *accumulator) finish(window int64, w ratingWeights) model.Metrics {
+	return a.finishWithThresholds(window, 10, 30*60*1000, w)
+}
+
+func (a *accumulator) finishWithThresholds(window, minSamples, minCoverageMS int64, w ratingWeights) model.Metrics {
 	m := a.m
 	if a.covered > 0 {
 		m.Availability = 100 * a.available / a.covered
@@ -709,12 +715,14 @@ func (a *accumulator) finishWithThresholds(window, minSamples, minCoverageMS int
 		}
 	}
 	m.Pollution = pollutionName(a.pollution)
-	// 50 ms earns the full latency component; 2 s or more earns zero.
-	latencyScore := math.Max(0, math.Min(100, 100*(2000-m.P95MS)/1950))
+	// Latency earns points from 2 s down to 200 ms, decreasing linearly so
+	// equal reliability tiers are told apart by latency while configured
+	// weights decide how much each component counts.
+	latencyScore := math.Max(0, math.Min(100, 100*(2000-m.P95MS)/1800))
 	if a.latencyCount == 0 {
 		latencyScore = 0
 	}
-	m.Score = .45*m.Availability + .35*m.SuccessRate + .20*latencyScore
+	m.Score = w.availability*m.Availability + w.successRate*m.SuccessRate + w.latency*latencyScore
 	switch {
 	case a.pollution == 4:
 		m.Grade = "F"
@@ -806,7 +814,7 @@ func (s *Store) Summary(since, now int64) ([]model.ServerSummary, error) {
 		return nil, err
 	}
 	for _, v := range servers {
-		value := model.ServerSummary{Server: v, Metrics: acc[v.ID].finishForServer(now-since, v.Trusted)}
+		value := model.ServerSummary{Server: v, Metrics: acc[v.ID].finishForServer(now-since, v.Trusted, configRatingWeights(config))}
 		value.Current, err = s.currentEvaluation(v, config, now)
 		if err != nil {
 			return nil, err
@@ -841,6 +849,10 @@ func (s *Store) History(serverID, since, now, stepMS int64) ([]model.HistoryPoin
 		return nil, model.Metrics{}, errors.New("invalid time range")
 	}
 	server, err := s.GetServer(serverID)
+	if err != nil {
+		return nil, model.Metrics{}, err
+	}
+	config, err := s.GetConfig()
 	if err != nil {
 		return nil, model.Metrics{}, err
 	}
@@ -935,11 +947,12 @@ func (s *Store) History(serverID, since, now, stepMS int64) ([]model.HistoryPoin
 		return nil, model.Metrics{}, err
 	}
 	values := make([]model.HistoryPoint, count)
+	w := configRatingWeights(config)
 	for i := range points {
 		at := since + int64(i)*stepMS
-		values[i] = model.HistoryPoint{Timestamp: at, Metrics: points[i].finishForServer(min(stepMS, now-at), server.Trusted)}
+		values[i] = model.HistoryPoint{Timestamp: at, Metrics: points[i].finishForServer(min(stepMS, now-at), server.Trusted, w)}
 	}
-	return values, total.finishForServer(now-since, server.Trusted), nil
+	return values, total.finishForServer(now-since, server.Trusted, w), nil
 }
 
 func oldestReference(refs []model.Reference) int64 {

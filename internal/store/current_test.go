@@ -32,6 +32,20 @@ func setCurrentThresholds(t *testing.T, s *Store, window, samples, coverage int)
 	}
 }
 
+func setCurrentWeights(t *testing.T, s *Store, avail, success, latency float64) {
+	t.Helper()
+	config, err := s.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RatingWAvail = avail
+	config.RatingWSuccess = success
+	config.RatingWLatency = latency
+	if err = s.SaveConfig(config); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCurrentUnknownReplacesOldAWithoutChangingHistory(t *testing.T) {
 	s, server := testStore(t)
 	at := time.Now().Add(-time.Hour).UnixMilli()
@@ -151,6 +165,58 @@ func TestCurrentWindowBoundariesBackoffAndLatency(t *testing.T) {
 	closeFloat(t, 10, current.CoveredMinutes)
 	closeFloat(t, 15.1, current.AverageMS)
 	closeFloat(t, 21, current.P95MS)
+}
+
+func TestRatingLatencyDecidesSameReliabilityTier(t *testing.T) {
+	s, fast := testStore(t)
+	slow, err := s.SaveServer(model.Server{Name: "slow", Address: "1.0.0.1", Protocol: "UDP", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCurrentThresholds(t, s, 60, 1, 0)
+	at := time.Now().UnixMilli()
+	fastRound := round(fast.ID, at, currentMinute, true, true, 12, 242, "matched")
+	fastRound.Results[11].Received = false
+	fastRound.Results[11].Success = false
+	mustSave(t, s, fastRound)
+	mustSave(t, s, round(slow.ID, at, currentMinute, true, true, 12, 1004, "matched"))
+	fastEval := currentAt(t, s, fast.ID, at)
+	slowEval := currentAt(t, s, slow.ID, at)
+	if fastEval.Grade != "B" {
+		t.Fatalf("fast server handled as worse than slow: %+v", fastEval)
+	}
+	if slowEval.Grade != "C" {
+		t.Fatalf("slow server not separated from the faster tier: %+v", slowEval)
+	}
+	if fastEval.Score <= slowEval.Score {
+		t.Fatalf("4x latency gap failed to decide same-tier reliability: fast %+v slow %+v", fastEval, slowEval)
+	}
+	closeFloat(t, 242, fastEval.P95MS)
+	closeFloat(t, 1004, slowEval.P95MS)
+}
+
+func TestCurrentRatingWeightsAreConfigurable(t *testing.T) {
+	s, server := testStore(t)
+	setCurrentThresholds(t, s, 60, 1, 0)
+	at := time.Now().UnixMilli()
+	mustSave(t, s, round(server.ID, at, currentMinute, true, true, 12, 500, "matched"))
+	defaultEval := currentAt(t, s, server.ID, at)
+	if defaultEval.Grade != "B" {
+		t.Fatalf("default weights lost balance: %+v", defaultEval)
+	}
+	setCurrentWeights(t, s, .5, .5, 0)
+	reliabilityEval := currentAt(t, s, server.ID, at)
+	if reliabilityEval.Grade != "A" {
+		t.Fatalf("reliability-only weights did not push score up: %+v", reliabilityEval)
+	}
+	setCurrentWeights(t, s, 0, 0, 1)
+	latencyEval := currentAt(t, s, server.ID, at)
+	if latencyEval.Grade != "C" {
+		t.Fatalf("latency-only weights did not push score down: %+v", latencyEval)
+	}
+	if !(defaultEval.Score < reliabilityEval.Score && defaultEval.Score > latencyEval.Score) {
+		t.Fatalf("weight change did not reorder scores: default %+v reliability %+v latency %+v", defaultEval, reliabilityEval, latencyEval)
+	}
 }
 
 func TestCurrentExpiryAndTrustedExemption(t *testing.T) {

@@ -131,7 +131,7 @@ func evaluateCurrent(db evaluationReader, server model.Server, config model.Conf
 		a.m.Availability = 100 * float64(received) / float64(a.m.Samples)
 	}
 	value.CoveredMinutes = a.covered / 60000
-	value.Metrics = a.finishWithThresholds(window, int64(value.MinSamples), int64(value.MinCoverageMinutes)*60000)
+	value.Metrics = a.finishWithThresholds(window, int64(value.MinSamples), int64(value.MinCoverageMinutes)*60000, configRatingWeights(config))
 	switch {
 	case latestSamples > 0 && latestSuccesses == 0:
 		value.Grade = "unavailable"

@@ -171,6 +171,12 @@ func ValidateConfig(c *model.Config) error {
 	if c.RatingMinCoverageMinutes > c.RatingWindowMinutes {
 		return errors.New("评级最低覆盖时间不能超过评级统计窗口")
 	}
+	if !(c.RatingWAvail >= 0 && c.RatingWAvail <= 1) || !(c.RatingWSuccess >= 0 && c.RatingWSuccess <= 1) || !(c.RatingWLatency >= 0 && c.RatingWLatency <= 1) {
+		return errors.New("评级权重须为 0–1 之间的小数")
+	}
+	if math.Abs(c.RatingWAvail+c.RatingWSuccess+c.RatingWLatency-1) > 0.001 {
+		return errors.New("三项评级权重之和必须等于 1")
+	}
 	if len(c.Domains) == 0 || len(c.Domains) > 100 {
 		return errors.New("请配置 1–100 个探测域名")
 	}
