@@ -396,13 +396,22 @@
     renderServerRows();
   }
 
+  function humanDuration(seconds) {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return `${days}天${hours}小时${minutes}分钟`;
+    if (hours > 0) return `${hours}小时${minutes}分钟`;
+    return `${Math.max(1, minutes)} 分钟`;
+  }
+
   function relativeProbe(server) {
     if (!server.enabled) return '已停止调度';
     if (!server.last_probe) return '等待首次采样';
     if (state.data.runtime?.paused) return '调度已暂停';
     if (server.next_due > Date.now()) {
       const seconds = Math.ceil((server.next_due - Date.now()) / 1000);
-      const text = seconds >= 60 ? `${Math.ceil(seconds / 60)} 分钟后` : `${seconds} 秒后`;
+      const text = seconds >= 60 ? `${humanDuration(seconds)}后` : `${seconds} 秒后`;
       return `${server.failures >= 3 && state.data.config?.smart_backoff && state.data.config?.max_backoff_hours > 0 ? '退避 · ' : ''}${text}`;
     }
     return '等待下一次探测';

@@ -282,3 +282,45 @@ func TestCurrentUnavailableOverridesTrustAndRecovers(t *testing.T) {
 		}
 	}
 }
+
+func TestCurrentBackoffExpiredFailureStaysUnavailable(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		name := "untrusted"
+		if trusted {
+			name = "trusted"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, server := testStore(t)
+			server.Trusted = trusted
+			if _, err := s.SaveServer(server); err != nil {
+				t.Fatal(err)
+			}
+			setCurrentThresholds(t, s, 60, 3, 5)
+			at := time.Now().UnixMilli()
+			// A purely failed round aged past the rating window, as during long backoff.
+			mustSave(t, s, round(server.ID, at-3*60*currentMinute, currentMinute, false, false, 1, 0, "unknown"))
+			got := currentAt(t, s, server.ID, at)
+			if got.Grade != "unavailable" || got.Score != 0 || got.Samples != 0 || got.PendingReason != "" {
+				t.Fatalf("stale failed round should stay unavailable: %+v", got)
+			}
+			// A still-latest successful round that expired means pending, not unavailable.
+			mustSave(t, s, round(server.ID, at-2*60*currentMinute, currentMinute, true, true, 1, 10, "matched"))
+			got = currentAt(t, s, server.ID, at)
+			if got.Grade != "pending" || got.PendingReason != "no_samples" {
+				t.Fatalf("stale successful round must stay pending: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCurrentNeverProbedStaysPending(t *testing.T) {
+	s, server := testStore(t)
+	if _, err := s.SaveServer(server); err != nil {
+		t.Fatal(err)
+	}
+	setCurrentThresholds(t, s, 60, 3, 5)
+	got := currentAt(t, s, server.ID, time.Now().UnixMilli())
+	if got.Grade != "pending" || got.PendingReason != "no_samples" {
+		t.Fatalf("never-probed server must stay pending: %+v", got)
+	}
+}

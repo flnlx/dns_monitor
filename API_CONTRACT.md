@@ -35,7 +35,7 @@ Main/root owns HTTP API, cmd/dns-monitor, Windows service manager, build/package
 - Raw CSV appends records_json, policy_version and compared_at, and effective_pollution comes from the same store policy as the UI. Overview CSV still exports exactly the filtered/sorted summary.
 
 ## Current availability grading
-- CurrentEvaluation.grade additionally supports `unavailable`: the latest non-auxiliary round within the rating window has samples but zero successful queries. It overrides trust, pollution grading and warm-up thresholds; current score is zero, performance metrics and pollution evidence remain intact. A newer successful round re-enters normal grading; no in-window samples means pending. Historical Metrics grading is unchanged.
+- CurrentEvaluation.grade additionally supports `unavailable`: the latest non-auxiliary formal round on record (any age, future excluded) has samples but zero successful queries. This holds even when that failed round has aged out of the rating window during long backoff. It overrides trust, pollution grading and warm-up thresholds; current score is zero, performance metrics and pollution evidence remain intact. A newer successful round re-enters normal grading; with no recorded round, or a latest recorded round that had a successful query, an empty rating window still means pending. Historical Metrics grading is unchanged.
 - UI displays 不可用, supports filtering/export, and pins unavailable servers last for all sort keys and directions.
 
 ## Immutable resolution-quality and rating history

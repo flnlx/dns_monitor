@@ -87,15 +87,16 @@ func evaluateCurrent(db evaluationReader, server model.Server, config model.Conf
 	}
 
 	// Reachability/lookup failure is independent of trust and historical scores.
-	// Only the latest formal round inside the rating window can establish it.
+	// The latest formal round on record decides it, not the rating-window lower
+	// bound: a server held in long backoff (whose last failed round has aged out
+	// of the window) must stay unavailable instead of falling back to pending.
+	// Future rounds are excluded.
 	var latestSamples, latestSuccesses int64
-	if value.QualityAt > 0 {
-		err = db.QueryRow(`SELECT samples,successes FROM rounds
- WHERE server_id=? AND auxiliary=0 AND finished_at>=? AND finished_at<=?
- ORDER BY finished_at DESC,id DESC LIMIT 1`, server.ID, since, now).Scan(&latestSamples, &latestSuccesses)
-		if err != nil {
-			return value, err
-		}
+	err = db.QueryRow(`SELECT samples,successes FROM rounds
+ WHERE server_id=? AND auxiliary=0 AND finished_at<=?
+ ORDER BY finished_at DESC,id DESC LIMIT 1`, server.ID, now).Scan(&latestSamples, &latestSuccesses)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return value, err
 	}
 
 	if server.Trusted {
