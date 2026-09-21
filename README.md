@@ -4,7 +4,7 @@
 
 > 英文版：[README.en.md](README.en.md)
 
-本地运行的 Windows IPv4 DNS 监测工具。Go 后端、原生网页、SQLite 存储，使用同目录 DOGGO 发送 DNS 请求。无需安装运行时，无在线网页依赖。
+本地运行的 Windows IPv4 DNS 监测工具。Go 后端、原生网页、SQLite 存储，使用同目录 DOGGO 发送 DNS 请求。无需安装运行时，无在线网页依赖。网页界面默认跟随浏览器语言（中文或英文），登录后可在左下角随时切换，选择会保存在本地。
 
 ## 人类的话
 

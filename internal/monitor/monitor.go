@@ -115,7 +115,8 @@ func (m *Monitor) Run(ctx context.Context) {
 	m.mu.Unlock()
 	nextDue := make(map[int64]int64)
 	failures := make(map[int64]int)
-	if summaries, err := m.st.Summary(time.Now().Add(-model.Retention).UnixMilli(), time.Now().UnixMilli()); err == nil {
+	now := time.Now().UnixMilli()
+	if summaries, err := m.st.Summary(now-model.Retention.Milliseconds(), now); err == nil {
 		for _, s := range summaries {
 			nextDue[s.ID] = s.NextDue
 			failures[s.ID] = s.Failures

@@ -27,7 +27,7 @@ import (
 	"dnsmonitor/internal/winservice"
 )
 
-const Version = "1.4.1"
+const Version = "1.5.0"
 
 type session struct{ expires time.Time }
 type Server struct {

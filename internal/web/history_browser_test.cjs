@@ -25,8 +25,9 @@ function buckets(range, empty=false) {
 let failHistory=false, slowSeven=false;
 (async()=>{
  const browser=await chromium.launch({executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
- const page=await browser.newPage({viewport:{width:1600,height:1100}});
- const errors=[]; page.on('pageerror',e=>errors.push(e.message));
+const page=await browser.newPage({viewport:{width:1600,height:1100}});
+  await page.addInitScript(() => { try { localStorage.setItem('dns-monitor.lang.v1', 'zh'); } catch {} });
+  const errors=[]; page.on('pageerror',e=>errors.push(e.message));
  await page.route('http://dns-history.test/**',async route=>{
   const url=new URL(route.request().url()), range=url.searchParams.get('range')||'24h';
   if(url.pathname.startsWith('/api')){
