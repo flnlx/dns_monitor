@@ -36,5 +36,28 @@ foreach ($line in $moduleDirs) {
 }
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'dist\DNSMonitor\licenses\go-modules.txt'), $moduleList, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path (& $goExe env GOROOT) 'LICENSE') -Destination dist\DNSMonitor\licenses\Go-LICENSE -Force
-Compress-Archive -Path dist\DNSMonitor -DestinationPath dist\DNSMonitor-windows-amd64.zip -Force
+# Stage a clean release tree so the portable ZIP never carries runtime state
+# (monitor.db, access-key.txt, instance.lock, *.log). The deployed
+# dist\DNSMonitor folder keeps any existing data untouched and in place.
+$stageRoot = Join-Path $PSScriptRoot 'dist\.staging'
+$stageDir = Join-Path $stageRoot 'DNSMonitor'
+if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
+New-Item -ItemType Directory -Force (Join-Path $stageDir 'licenses') | Out-Null
+Copy-Item -LiteralPath 'dist\DNSMonitor\dns-monitor.exe' -Destination $stageDir -Force
+Copy-Item -LiteralPath README.md -Destination (Join-Path $stageDir $readmeFileName) -Force
+Copy-Item -LiteralPath LICENSE -Destination $stageDir -Force
+Copy-Item -LiteralPath start.cmd,manage-service.cmd -Destination $stageDir -Force
+if (Test-Path -LiteralPath VALIDATION.md) { Copy-Item -LiteralPath VALIDATION.md -Destination (Join-Path $stageDir $validationFileName) -Force }
+Get-ChildItem -LiteralPath 'dist\DNSMonitor\licenses' -File | Copy-Item -Destination (Join-Path $stageDir 'licenses') -Force
+Compress-Archive -Path $stageDir -DestinationPath dist\DNSMonitor-windows-amd64.zip -Force
+# Regression guard: the release ZIP must never contain runtime data or logs.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$reader = [IO.Compression.ZipFile]::OpenRead((Join-Path $PSScriptRoot 'dist\DNSMonitor-windows-amd64.zip'))
+try {
+  $bad = @($reader.Entries | ForEach-Object { $_.FullName } | Where-Object { $_ -match '(^|/)(data|logs)/' -or $_ -match '\.(db|db-wal|db-shm)$' })
+} finally {
+  $reader.Dispose()
+}
+if ($bad.Count -gt 0) { throw "Refusing release ZIP containing runtime state: $($bad -join ',')" }
+Remove-Item -LiteralPath $stageRoot -Recurse -Force
 Write-Host 'Portable package: dist\DNSMonitor-windows-amd64.zip'

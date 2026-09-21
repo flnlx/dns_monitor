@@ -71,6 +71,14 @@ jobs:
           "app=$app" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "size=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $reader = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $bad = @($reader.Entries | ForEach-Object { $_.FullName } | Where-Object { $_ -match '(^|/)(data|logs)/' -or $_ -match '\.(db|db-wal|db-shm)$' })
+          } finally {
+            $reader.Dispose()
+          }
+          if ($bad.Count -gt 0) { throw "Release zip must not contain runtime data/logs: $($bad -join ',')" }
           $summary = @(
             $app
             ('Package size: {0:N2} MiB' -f ($size / 1MB))
@@ -105,12 +113,13 @@ jobs:
             "- SHA256：$env:HASH"
             ""
             "### 变更"
+            "- **便携包不再包含运行时数据（data/logs）**：覆盖解压不会触碰你已有的监测数据"
             "- **移除捆绑 doggo**：doggo.exe 不再随包分发，需自行放置在 dns-monitor.exe 同目录或安装到 PATH"
             "- 启动时自动查找同目录 doggo.exe，未找到时提示安装方式"
             "- 项目新增 GPL v3 许可证文件"
             ""
             "解压后将 doggo.exe 放在 dns-monitor.exe 旁，双击 start.cmd 启动，网页默认 http://127.0.0.1:8080。"
-            "升级前请退出旧程序并备份 data 目录；详见包内 使用说明.md。"
+            "升级前请退出旧程序；data 目录始终位于程序目录下，不会被本次发布包覆盖。"
           )
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           [IO.File]::WriteAllText($notesFile, ($notes -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
