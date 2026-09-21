@@ -6,3 +6,4 @@
 /dns-monitor.test.exe
 /.test-output/
 *.test
+/AGENTS.md
