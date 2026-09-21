@@ -3,7 +3,10 @@
 (() => {
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'grade', descending: false, detailID: null, history: [], statusHistory: [], historyMetrics: null, results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null };
+  const filterStorageKey = 'dns-monitor.filters.v1';
+  const storedFilters = (() => { try { const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(filterStorageKey) : null; return raw ? JSON.parse(raw) : {}; } catch { return {}; } })();
+  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'grade', descending: false, detailID: null, history: [], statusHistory: [], historyMetrics: null, results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null, filters: { protocol: Array.isArray(storedFilters.protocol) ? storedFilters.protocol.filter(value => typeof value === 'string') : [], pollution: Array.isArray(storedFilters.pollution) ? storedFilters.pollution.filter(value => ['matched', 'clean', 'suspicious', 'polluted', 'unknown'].includes(value)) : [], grade: Array.isArray(storedFilters.grade) ? storedFilters.grade.filter(value => typeof value === 'string') : [] } };
+  const persistFilters = () => { try { if (typeof localStorage !== 'undefined') localStorage.setItem(filterStorageKey, JSON.stringify({ protocol: state.filters.protocol, pollution: state.filters.pollution, grade: state.filters.grade })); } catch { /* storage unavailable */ } };
   const ranges = { '24h': 24 * 3600000, '7d': 7 * 86400000, '30d': 30 * 86400000 };
   const titles = { overview: ['监测总览', 'NETWORK OBSERVABILITY'], config: ['探测配置', 'MONITORING PREFERENCES'], service: ['Windows 服务', 'ALWAYS-ON MONITORING'], guide: ['使用指南', 'YOUR OBSERVATION HANDBOOK'] };
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -307,6 +310,69 @@
     $('#nav-server-count').textContent = state.data.servers.length;
   }
 
+  const multiSelectSpecs = {
+    protocol: { label: '全部协议', list: servers => [...new Set(servers.map(server => server.protocol).filter(Boolean))].sort().map(value => ({ value, label: value.toUpperCase() })), valueOf: server => server.protocol },
+    pollution: { label: '全部解析状态', list: () => [['matched', '参考一致'], ['clean', '正常'], ['suspicious', '可疑'], ['polluted', '疑似 / 确认污染'], ['unknown', '待判定']].map(([value, label]) => ({ value, label })), valueOf: server => pollutionKind(serverPollution(server)) },
+    grade: { label: '全部评级', list: () => [['A', 'A · 优秀'], ['B', 'B · 良好'], ['C', 'C · 一般'], ['D', 'D · 较差'], ['E', 'E · 可疑'], ['F', 'F · 疑似 / 确认污染'], ['pending', '待评估'], ['unavailable', '不可用']].map(([value, label]) => ({ value, label })), valueOf: server => { const value = displayedGrade(currentEvaluation(server), server.trusted); return ['A', 'B', 'C', 'D', 'E', 'F', 'unavailable'].includes(value) ? value : 'pending'; } }
+  };
+  let filterSignatures = {};
+
+  function filterOptionList(key) {
+    const servers = state.data?.servers || [];
+    const list = multiSelectSpecs[key].list(servers);
+    const counts = new Map(list.map(option => [option.value, 0]));
+    servers.forEach(server => { const value = multiSelectSpecs[key].valueOf(server); const count = counts.get(value); if (count !== undefined) counts.set(value, count + 1); });
+    return { list, counts };
+  }
+
+  function updateFilterSummary(key) {
+    const summary = $(`[data-summary="${key}"]`);
+    if (summary) summary.textContent = state.filters[key].length ? `已选 ${state.filters[key].length} 项` : multiSelectSpecs[key].label;
+  }
+
+  function renderFilterOptions(key) {
+    const root = $(`#${key}-filter-root`);
+    if (!root) return;
+    const { list, counts } = filterOptionList(key);
+    const available = list.map(option => option.value);
+    state.filters[key] = state.filters[key].filter(value => available.includes(value));
+    const signature = list.map(option => `${option.value}:${option.label}:${counts.get(option.value) || 0}`).join('|');
+    const optionsElement = $(`[data-options="${key}"]`, root);
+    if (!optionsElement) return;
+    if (filterSignatures[key] !== signature) {
+      optionsElement.innerHTML = list.map(option => `<label class="multi-option"><input type="checkbox" value="${escape(option.value)}"><span class="multi-option-text">${escape(option.label)}</span><span class="multi-option-count">${integer(counts.get(option.value) || 0)}</span></label>`).join('');
+      filterSignatures[key] = signature;
+    }
+    $$('input[type=checkbox]', optionsElement).forEach(input => { input.checked = state.filters[key].includes(input.value); });
+    const all = $(`[data-all="${key}"]`, root);
+    if (all) all.checked = state.filters[key].length === 0;
+    updateFilterSummary(key);
+  }
+
+  function renderAllFilters() { Object.keys(multiSelectSpecs).forEach(renderFilterOptions); }
+
+  function closeFilterPopovers() {
+    $$('.multi-select[data-filter]').forEach(root => {
+      const key = root.dataset.filter;
+      const popover = $(`[data-popover="${key}"]`, root);
+      if (popover) popover.hidden = true;
+      const trigger = $(`[data-trigger="${key}"]`, root);
+      if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  function toggleFilterPopover(key) {
+    const root = $(`#${key}-filter-root`);
+    if (!root) return;
+    const popover = $(`[data-popover="${key}"]`, root);
+    if (!popover) return;
+    const opening = popover.hidden;
+    closeFilterPopovers();
+    popover.hidden = !opening;
+    const trigger = $(`[data-trigger="${key}"]`, root);
+    if (trigger) trigger.setAttribute('aria-expanded', String(opening));
+  }
+
   function renderOverview() {
     const servers = state.data.servers;
     const enabled = servers.filter(server => server.enabled);
@@ -326,10 +392,7 @@
     $('#summary-cards').innerHTML = cards.map(card => `<article class="summary-card ${card.kind}"><div class="summary-top"><span>${escape(card.title)}</span><span class="summary-icon" aria-hidden="true">${escape(card.icon)}</span></div><div class="summary-value">${card.value}<small>${card.unit}</small></div><p class="summary-caption">${escape(card.caption)}</p></article>`).join('');
     $('#server-total').textContent = servers.length;
     $('#rating-explanation').textContent = `时延、可用率和成功率按所选历史区间统计；当前解析质量取最新正式探测，当前评级使用最近 ${state.data.config?.rating_window_minutes ?? 60} 分钟。待判定时不延续旧的正常评级；点击域名可查看原因与人工复核。`;
-    const selectedProtocol = $('#protocol-filter').value;
-    const protocols = [...new Set(servers.map(server => server.protocol).filter(Boolean))].sort();
-    $('#protocol-filter').innerHTML = `<option value="">全部协议</option>${protocols.map(protocol => `<option value="${escape(protocol)}">${escape(protocol.toUpperCase())}</option>`).join('')}`;
-    $('#protocol-filter').value = protocols.includes(selectedProtocol) ? selectedProtocol : '';
+    renderAllFilters();
     renderServerRows();
   }
 
@@ -354,14 +417,14 @@
   function visibleServers() {
     if (!state.data) return [];
     const search = $('#search-filter').value.trim().toLowerCase();
-    const protocol = $('#protocol-filter').value;
-    const pollution = $('#pollution-filter').value;
-    const grade = $('#grade-filter').value;
+    const protocol = state.filters.protocol;
+    const pollution = state.filters.pollution;
+    const grade = state.filters.grade;
     const servers = state.data.servers.filter(server => {
       const metrics = server.metrics || {};
       const value = displayedGrade(currentEvaluation(server), server.trusted);
       const gradeValue = ['A', 'B', 'C', 'D', 'E', 'F', 'unavailable'].includes(value) ? value : 'pending';
-      return (!search || [server.name, server.provider, server.address].some(value => String(value || '').toLowerCase().includes(search))) && (!protocol || server.protocol === protocol) && (!pollution || pollutionKind(serverPollution(server)) === pollution) && (!grade || gradeValue === grade);
+      return (!search || [server.name, server.provider, server.address].some(value => String(value || '').toLowerCase().includes(search))) && (!protocol.length || protocol.includes(server.protocol)) && (!pollution.length || pollution.includes(pollutionKind(serverPollution(server)))) && (!grade.length || grade.includes(gradeValue));
     });
     servers.sort((left, right) => {
       // Failed servers stay last for every sort direction and metric.
@@ -1135,7 +1198,24 @@
   $$('[data-range]').forEach(button => button.addEventListener('click', () => changeRange(button.dataset.range)));
   $$('.sort-button').forEach(button => button.addEventListener('click', () => { state.descending = state.sort === button.dataset.sort ? !state.descending : !['average_ms', 'grade'].includes(button.dataset.sort); state.sort = button.dataset.sort; renderServerRows(); }));
   $('#search-filter').addEventListener('input', renderServerRows);
-  ['protocol', 'pollution', 'grade'].forEach(filter => $(`#${filter}-filter`).addEventListener('change', renderServerRows));
+  $$('[data-trigger]').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); toggleFilterPopover(button.dataset.trigger); }));
+  $$('.multi-select [data-popover]').forEach(popover => popover.addEventListener('change', event => {
+    const checkbox = event.target.closest('input[type=checkbox]');
+    if (!checkbox) return;
+    const key = popover.dataset.popover;
+    if (checkbox.dataset.all !== undefined) state.filters[key] = [];
+    else {
+      const current = state.filters[key];
+      const index = current.indexOf(checkbox.value);
+      if (checkbox.checked && index < 0) current.push(checkbox.value);
+      if (!checkbox.checked && index >= 0) current.splice(index, 1);
+    }
+    persistFilters();
+    renderFilterOptions(key);
+    renderServerRows();
+  }));
+  document.addEventListener('click', event => { if (!event.target.closest('.multi-select')) closeFilterPopovers(); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeFilterPopovers(); });
   $('#add-server-button').addEventListener('click', () => openServer());
   $('#empty-add-button').addEventListener('click', () => openServer());
   $('#server-form').addEventListener('submit', saveServer);

@@ -2,7 +2,7 @@
 
 # DNS Monitor
 
-> 英文版：\[README.en.md](README.en.md)
+> 英文版：[README.en.md](README.en.md)
 
 本地运行的 Windows IPv4 DNS 监测工具。Go 后端、原生网页、SQLite 存储，使用同目录 DOGGO 发送 DNS 请求。无需安装运行时，无在线网页依赖。
 
@@ -55,7 +55,7 @@ quic://dns.adguard-dns.com
 sdns://...
 ```
 
-DNS stamp 支持普通 UDP、IPv4 DNSCrypt，以及不附带固定 IP、证书 hash 和 bootstrap 约束的 DoH/DoT/DoQ。随包 DOGGO 不能正确保留这些加密 stamp 约束，遇到它们会明确拒绝，建议填写对应标准上游 URL。AdGuard Home 的分域路由指令（如 `\[/example.com/]...`）、特殊 `#` 系统默认上游和不安全 TLS 选项不属于单台被测服务器地址，保存时会明确拒绝。域名上游启动解析依赖主机可用的 IPv4 DNS；本项目不修改系统 DNS。探测隔离继承的 DOGGO 配置和 HTTP(S) 代理环境变量，直接测量 DNS 访问路径。加密协议额外绑定 IPv4 来源，保留 TLS 证书校验。
+DNS stamp 支持普通 UDP、IPv4 DNSCrypt，以及不附带固定 IP、证书 hash 和 bootstrap 约束的 DoH/DoT/DoQ。随包 DOGGO 不能正确保留这些加密 stamp 约束，遇到它们会明确拒绝，建议填写对应标准上游 URL。AdGuard Home 的分域路由指令（如 `[/example.com/]...`）、特殊 `#` 系统默认上游和不安全 TLS 选项不属于单台被测服务器地址，保存时会明确拒绝。域名上游启动解析依赖主机可用的 IPv4 DNS；本项目不修改系统 DNS。探测隔离继承的 DOGGO 配置和 HTTP(S) 代理环境变量，直接测量 DNS 访问路径。加密协议额外绑定 IPv4 来源，保留 TLS 证书校验。
 
 ## 可信参考与四档判定
 
@@ -122,18 +122,18 @@ DOGGO 的 `--do`、`--ad` 与权威查询不足以自行证明 DNSSEC 完整签�
 管理员终端也可使用：
 
 ```powershell
-.\\dns-monitor.exe service install
-.\\dns-monitor.exe service start
-.\\dns-monitor.exe service status
-.\\dns-monitor.exe service stop
-.\\dns-monitor.exe service uninstall
+.\dns-monitor.exe service install
+.\dns-monitor.exe service start
+.\dns-monitor.exe service status
+.\dns-monitor.exe service stop
+.\dns-monitor.exe service uninstall
 ```
 
 可选启动参数必须置于子命令之前，例如：
 
 ```powershell
-.\\dns-monitor.exe --listen 127.0.0.1:8088 --open
-.\\dns-monitor.exe --data-dir D:\\DNSData --doggo D:\\Tools\\doggo.exe service install
+.\dns-monitor.exe --listen 127.0.0.1:8088 --open
+.\dns-monitor.exe --data-dir D:\DNSData --doggo D:\Tools\doggo.exe service install
 ```
 
 ## 开发与构建
@@ -157,7 +157,7 @@ go install github.com/mr-karan/doggo/cmd/doggo@latest
 程序启动时按以下顺序查找 doggo：① `--doggo` 参数指定路径 → ② 程序同目录 `doggo.exe` → ③ PATH 环境变量。均未找到时给出安装指引。
 
 ```powershell
-.\\build.ps1
+.\build.ps1
 ```
 
 构建脚本执行测试和 `go vet`，生成便携目录与 ZIP，并收集第三方许可证。工具链如不在 PATH，可放入 `.tools/go`。`.tools`、`data`、`logs`、`dist` 均不进入 Git。

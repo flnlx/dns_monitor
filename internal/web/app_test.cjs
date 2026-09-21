@@ -5,12 +5,13 @@ const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, 'assets/app.js'), 'utf8');
 // Exercise the actual view helpers without starting network requests or timers.
-function view() {
+function view(seed = {}) {
   const filters = {};
-  const context = vm.createContext({ document: { querySelector: selector => ({ value: filters[selector] || '' }) } });
+  const storage = { ...seed };
+  const context = vm.createContext({ document: { querySelector: selector => ({ value: filters[selector] || '' }) }, localStorage: { getItem: key => (key in storage ? storage[key] : null), setItem: (key, value) => { storage[key] = value; } } });
   const helpers = source.slice(source.indexOf("  const $ ="), source.indexOf('  function setError'));
   const sorting = source.slice(source.indexOf('  function visibleServers()'), source.indexOf('  function renderServerRows()'));
-  return { filters, ...vm.runInContext(helpers + sorting + '\n({state, visibleServers, gradeHTML, displayedGrade, statusStrip, statusDescription, compactHistory})', context) };
+  return { filters, storage, ...vm.runInContext(helpers + sorting + '\n({state, persistFilters, visibleServers, gradeHTML, displayedGrade, statusStrip, statusDescription, compactHistory})', context) };
 }
 test('unavailable is last for every sort key and direction, including trusted servers', () => {
   const ui = view();
@@ -26,12 +27,30 @@ test('unavailable is last for every sort key and direction, including trusted se
   }
   Object.assign(ui.state, { sort: 'grade', descending: false });
   assert.equal(ui.visibleServers().map(s => s.current.grade).join(','), 'A,D,F,pending,unavailable');
-  ui.filters['#grade-filter'] = 'unavailable';
+  ui.state.filters.grade = ['unavailable'];
   assert.equal(ui.visibleServers().length, 1);
   assert.equal(ui.visibleServers()[0].id, 0);
+  ui.state.filters.grade = ['A', 'D', 'unavailable'];
+  assert.equal(ui.visibleServers().map(s => s.current.grade).join(','), 'A,D,unavailable');
+  ui.state.filters.grade = ['unavailable'];
+  ui.state.filters.pollution = ['clean'];
+  assert.equal(ui.visibleServers().length, 1, 'trusted servers map to a clean pollution value');
+  ui.state.filters.pollution = ['unknown'];
+  assert.equal(ui.visibleServers().length, 0, 'grade and pollution multi-filters combine with AND');
   assert.equal(ui.displayedGrade({grade: 'unavailable'}, true), 'unavailable');
   assert.match(ui.gradeHTML('unavailable', {}), /grade-unavailable/);
   assert.match(ui.gradeHTML('unavailable', {}), /不可用/);
+});
+
+test('multi-select filter choices survive reloads through localStorage', () => {
+  const seed = { 'dns-monitor.filters.v1': JSON.stringify({ protocol: ['tls', 'https'], pollution: ['polluted'], grade: ['A'] }) };
+  const ui = view(seed);
+  assert.deepEqual(ui.state.filters, { protocol: ['tls', 'https'], pollution: ['polluted'], grade: ['A'] });
+  ui.state.filters.grade = ['A', 'F'];
+  ui.persistFilters();
+  const parsed = JSON.parse(ui.storage['dns-monitor.filters.v1']);
+  assert.deepEqual(parsed, { protocol: ['tls', 'https'], pollution: ['polluted'], grade: ['A', 'F'] });
+  assert.deepEqual(view({ 'dns-monitor.filters.v1': ui.storage['dns-monitor.filters.v1'] }).state.filters, { protocol: ['tls', 'https'], pollution: ['polluted'], grade: ['A', 'F'] });
 });
 
 test('history keeps past F for currently trusted servers and distinguishes gaps from pending', () => {
