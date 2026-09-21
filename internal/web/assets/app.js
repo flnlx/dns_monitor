@@ -5,8 +5,12 @@
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const filterStorageKey = 'dns-monitor.filters.v1';
   const storedFilters = (() => { try { const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(filterStorageKey) : null; return raw ? JSON.parse(raw) : {}; } catch { return {}; } })();
-  const state = { token: '', data: null, range: '24h', detailRange: '24h', page: 'overview', sort: 'grade', descending: false, detailID: null, history: [], statusHistory: [], historyMetrics: null, results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null, filters: { protocol: Array.isArray(storedFilters.protocol) ? storedFilters.protocol.filter(value => typeof value === 'string') : [], pollution: Array.isArray(storedFilters.pollution) ? storedFilters.pollution.filter(value => ['matched', 'clean', 'suspicious', 'polluted', 'unknown'].includes(value)) : [], grade: Array.isArray(storedFilters.grade) ? storedFilters.grade.filter(value => typeof value === 'string') : [] } };
+  const sessionKey = 'dns-monitor.session.v1';
+  const storedSession = (() => { try { if (typeof sessionStorage === 'undefined') return null; const raw = sessionStorage.getItem(sessionKey); return raw ? JSON.parse(raw) : null; } catch { return null; } })();
+  const state = { token: storedSession?.token || '', data: null, range: '24h', detailRange: '24h', page: ['overview', 'config', 'service', 'guide'].includes(storedSession?.page) ? storedSession.page : 'overview', sort: 'grade', descending: false, detailID: null, history: [], statusHistory: [], historyMetrics: null, results: [], result: null, refreshTimer: null, refreshing: false, configDirty: false, loadingResults: null, resultEnd: false, detailRequest: 0, resultsRequest: 0, serviceBusy: false, manualRefresh: null, manualTimer: null, detailProbe: null, detailProbeTimer: null, importing: null, filters: { protocol: Array.isArray(storedFilters.protocol) ? storedFilters.protocol.filter(value => typeof value === 'string') : [], pollution: Array.isArray(storedFilters.pollution) ? storedFilters.pollution.filter(value => ['matched', 'clean', 'suspicious', 'polluted', 'unknown'].includes(value)) : [], grade: Array.isArray(storedFilters.grade) ? storedFilters.grade.filter(value => typeof value === 'string') : [] } };
   const persistFilters = () => { try { if (typeof localStorage !== 'undefined') localStorage.setItem(filterStorageKey, JSON.stringify({ protocol: state.filters.protocol, pollution: state.filters.pollution, grade: state.filters.grade })); } catch { /* storage unavailable */ } };
+  const persistSession = () => { try { if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(sessionKey, JSON.stringify({ token: state.token, page: state.page })); } catch { /* storage unavailable */ } };
+  const clearSession = () => { try { if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(sessionKey); } catch { /* storage unavailable */ } };
   const ranges = { '24h': 24 * 3600000, '7d': 7 * 86400000, '30d': 30 * 86400000 };
   const titles = { overview: ['监测总览', 'NETWORK OBSERVABILITY'], config: ['探测配置', 'MONITORING PREFERENCES'], service: ['Windows 服务', 'ALWAYS-ON MONITORING'], guide: ['使用指南', 'YOUR OBSERVATION HANDBOOK'] };
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -119,6 +123,7 @@
 
   function resetSession(message = '') {
     state.token = '';
+    clearSession();
     clearTimeout(state.refreshTimer);
     clearTimeout(state.manualTimer);
     clearTimeout(state.detailProbeTimer);
@@ -166,6 +171,7 @@
       try { body = await response.json(); } catch { body = null; }
       if (!response.ok || !body?.token) throw new Error(response.status === 401 ? '访问密钥不正确，请检查 data/access-key.txt。' : body?.error || '无法连接观测台，请确认程序正在运行。');
       state.token = body.token;
+      persistSession();
       $('#access-key').value = '';
       $('#login-screen').hidden = true;
       $('#app').hidden = false;
@@ -483,13 +489,14 @@
     });
   }
 
-  async function navigate(page) {
-    if (!titles[page] || state.page === page) return;
+  async function navigate(page, boot = false) {
+    if (!titles[page] || (state.page === page && !boot)) return;
     if (state.page === 'config' && state.configDirty) {
       if (!(await confirmAction('离开探测配置', '当前更改尚未保存，离开将放弃这些更改。', '放弃更改'))) return;
       state.configDirty = false;
     }
     state.page = page;
+    if (!boot) persistSession();
     $$('.page').forEach(section => { section.hidden = section.id !== `page-${page}`; });
     $$('.nav-item').forEach(button => {
       const active = button.dataset.page === page;
@@ -1293,4 +1300,13 @@
   window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderCharts, 100); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden && state.token) refreshState(); });
   window.addEventListener('beforeunload', event => { if (state.configDirty) { event.preventDefault(); event.returnValue = ''; } });
+  if (storedSession?.token) {
+    state.token = storedSession.token;
+    persistSession();
+    $('#login-screen').hidden = true;
+    $('#app').hidden = false;
+    if (state.page !== 'overview') navigate(state.page, true);
+    refreshState(true);
+    scheduleRefresh();
+  }
 })();
