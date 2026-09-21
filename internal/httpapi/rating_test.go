@@ -153,7 +153,7 @@ func TestHistoryAndSummaryExposeCurrentEvaluation(t *testing.T) {
 	if len(state.Servers) != 1 || len(state.Servers[0].StatusHistory) != 60 {
 		t.Fatal("state missing compact status history")
 	}
-	if state.Version != "1.4.1" || len(state.Servers) != 1 || state.Servers[0].Metrics.Grade != "F" || state.Servers[0].Current.Grade != "A" {
+	if state.Version != "1.5.0" || len(state.Servers) != 1 || state.Servers[0].Metrics.Grade != "F" || state.Servers[0].Current.Grade != "A" {
 		t.Fatalf("state contract lost current or historical evaluation: %+v", state)
 	}
 }
